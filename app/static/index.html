@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="max-history-messages" content="{{MAX_HISTORY_MESSAGES}}">
+  <meta name="max-history-chars" content="{{MAX_HISTORY_CHARS}}">
+  <title>HR Assistant</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 760px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      color: #222;
+    }
+    h1 { font-size: 1.5rem; }
+    #conversation {
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      padding: 1rem;
+      min-height: 200px;
+      margin-bottom: 1rem;
+    }
+    .message { margin: 0 0 0.8rem; white-space: pre-wrap; }
+    .user { font-weight: bold; }
+    .tools, .request-id { font-size: 0.85rem; color: #666; }
+    .error { color: #b00020; }
+    form, .key-row { display: flex; gap: 0.5rem; }
+    .key-row { align-items: center; margin-bottom: 1rem; }
+    input { flex: 1; padding: 0.5rem; font-size: 1rem; }
+    button { padding: 0.5rem 1rem; font-size: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Asistente de Recursos Humanos</h1>
+  <div class="key-row">
+    <label for="api-key">Clave de acceso</label>
+    <input id="api-key" data-testid="api-key" type="password"
+           placeholder="Escribe la clave que te dieron" autocomplete="off">
+  </div>
+  <div id="conversation" data-testid="answer" aria-live="polite"></div>
+  <form id="ask-form">
+    <input id="question" data-testid="question" type="text"
+           placeholder="Pregunta por un empleado (EMP-0001) o un departamento"
+           autocomplete="off">
+    <button id="send" data-testid="send" type="submit">Enviar</button>
+  </form>
+  <script>
+    // El historial vive solo en el navegador y se manda en cada pregunta.
+    const history = [];
+    const conversation = document.getElementById("conversation");
+    const form = document.getElementById("ask-form");
+    const input = document.getElementById("question");
+    const button = document.getElementById("send");
+    const keyInput = document.getElementById("api-key");
+
+    // La clave vive solo en sessionStorage: se borra al cerrar la pestaña y
+    // nunca va escrita en la página.
+    const API_KEY_STORAGE = "hrAssistantApiKey";
+    function readStoredKey() {
+      try {
+        return sessionStorage.getItem(API_KEY_STORAGE) || "";
+      } catch (storageError) {
+        return "";
+      }
+    }
+    function storeKey(value) {
+      try {
+        if (value) {
+          sessionStorage.setItem(API_KEY_STORAGE, value);
+        } else {
+          sessionStorage.removeItem(API_KEY_STORAGE);
+        }
+      } catch (storageError) {
+        // Sin almacenamiento, la clave se lee del campo en cada pregunta.
+      }
+    }
+    keyInput.value = readStoredKey();
+    keyInput.addEventListener("input", () => storeKey(keyInput.value.trim()));
+
+    // Explica el error según el código HTTP de la respuesta.
+    function errorReason(response) {
+      if (response.status === 401) {
+        return "Clave inválida.";
+      }
+      if (response.status === 429) {
+        const seconds = parseInt(response.headers.get("Retry-After"), 10);
+        const wait = Number.isInteger(seconds) && seconds > 0 ? seconds : 1;
+        return "Demasiadas preguntas; espera " + wait + " segundos.";
+      }
+      if (response.status === 422) {
+        return "La pregunta no es válida (vacía o demasiado larga).";
+      }
+      return "El servidor respondió con un error.";
+    }
+
+    // Topes del historial que acepta el servidor (los llena al servir la página).
+    function readLimit(name) {
+      const meta = document.querySelector('meta[name="' + name + '"]');
+      const value = meta ? parseInt(meta.content, 10) : NaN;
+      return Number.isInteger(value) && value > 0 ? value : null;
+    }
+    const maxHistoryMessages = readLimit("max-history-messages");
+    const maxHistoryChars = readLimit("max-history-chars");
+
+    // Manda solo los últimos mensajes y recorta cada texto al tope del servidor.
+    function historyToSend() {
+      const recent = maxHistoryMessages === null
+        ? history
+        : history.slice(-maxHistoryMessages);
+      return recent.map((message) => ({
+        role: message.role,
+        content: maxHistoryChars === null
+          ? message.content
+          : message.content.slice(0, maxHistoryChars),
+      }));
+    }
+
+    // Agrega un párrafo con texto plano (nunca HTML) a la conversación.
+    function addLine(text, className) {
+      const line = document.createElement("p");
+      line.className = "message " + className;
+      line.textContent = text;
+      conversation.appendChild(line);
+      return line;
+    }
+
+    // Muestra el id de la petición para que la persona lo pase a soporte.
+    function addRequestId(requestId) {
+      if (requestId) {
+        addLine("Id de la petición: " + requestId, "request-id");
+      }
+    }
+
+    async function ask(question) {
+      let body;
+      try {
+        const apiKey = keyInput.value.trim();
+        storeKey(apiKey);
+        const response = await fetch("/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
+          body: JSON.stringify({ question: question, history: historyToSend() }),
+        });
+        if (!response.ok) {
+          addLine("Error: " + errorReason(response), "error");
+          let errorBody = {};
+          try {
+            errorBody = await response.json();
+          } catch (parseError) {
+            errorBody = {};
+          }
+          addRequestId(errorBody.request_id || response.headers.get("X-Request-ID"));
+          return;
+        }
+        body = await response.json();
+      } catch (error) {
+        addLine("Error: no se pudo conectar con el servidor.", "error");
+        return;
+      }
+      addLine("Tú: " + question, "user");
+      addLine("Asistente: " + body.answer, "assistant");
+      const tools = body.tools_used.length ? body.tools_used.join(", ") : "ninguna";
+      addLine("Herramientas usadas: " + tools, "tools");
+      addRequestId(body.request_id);
+      history.push({ role: "user", content: question });
+      history.push({ role: "assistant", content: body.answer });
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const question = input.value.trim();
+      if (!question) {
+        addLine("Error: escribe una pregunta.", "error");
+        return;
+      }
+      button.disabled = true;
+      await ask(question);
+      button.disabled = false;
+      input.value = "";
+      input.focus();
+    });
+  </script>
+</body>
+</html>

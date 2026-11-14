@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+httpx
+langsmith
+pytest
+pytest-bdd
+pytest-cov

@@ -1,0 +1,30 @@
+# Secretos: nunca entran a la imagen
+.env
+.env.*
+
+# Pruebas, que no corren en el contenedor
+tests/
+e2e/
+
+# Cachés y resultados de herramientas
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.pylint.d/
+.coverage
+.coverage.*
+htmlcov/
+
+# Entornos, control de versiones y archivos que la imagen no usa
+.venv/
+venv/
+.git/
+.github/
+.gitignore
+.dockerignore
+Dockerfile
+render.yaml
+scripts/
+doc/

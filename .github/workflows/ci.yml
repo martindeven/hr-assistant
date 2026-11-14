@@ -1,0 +1,98 @@
+# Pipeline de CI del HR Assistant (spec/04-production.md, punto 6; doc/adr/0012).
+# Cuatro etapas encadenadas: si una falla, las siguientes no corren y Render no publica
+# (render.yaml usa autoDeployTrigger: checksPass).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Etapa 1: estilo con pylint, líneas de máximo 88 caracteres (como verification qa)
+  style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Instalar dependencias
+        # pylint no va en requirements.txt: solo lo usa esta etapa
+        run: |
+          pip install -r requirements.txt
+          pip install pylint
+      - name: pylint
+        run: >-
+          python -m pylint app tests --max-line-length=88 --fail-under=10
+          --disable=missing-function-docstring,redefined-outer-name,too-few-public-methods
+
+  # Etapa 2: pruebas unitarias y BDD con cobertura de 80 % o más
+  unit:
+    needs: style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+      - name: Pruebas con cobertura
+        run: python -m pytest tests -q --cov=app --cov-report=term --cov-fail-under=80
+
+  # Etapa 3: Playwright contra el producto vivo con el modelo simulado
+  e2e:
+    needs: unit
+    runs-on: ubuntu-latest
+    env:
+      # Clave de ejemplo, solo para esta corrida: no es un secreto ni sirve en Render
+      CI_EXAMPLE_KEY: ci-example-key-not-a-secret
+      MODEL_PROVIDER: fake
+      RATE_LIMIT_PER_MINUTE: "1000"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Instalar dependencias
+        # pytest-playwright no va en requirements.txt: solo lo usa esta etapa
+        run: |
+          pip install -r requirements.txt
+          pip install pytest-playwright
+          python -m playwright install --with-deps chromium
+      - name: Arrancar el producto
+        run: |
+          API_KEYS="ci:${CI_EXAMPLE_KEY}" \
+            nohup python -m uvicorn app.main:app --port 8000 > server.log 2>&1 &
+          # Espera hasta 20 s a que /health responda
+          for _ in $(seq 1 40); do
+            if python -c "import httpx; httpx.get('http://127.0.0.1:8000/health').raise_for_status()" 2>/dev/null; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "El producto no arrancó"
+          cat server.log
+          exit 1
+      - name: Pruebas de punta a punta
+        env:
+          E2E_API_KEY: ${{ env.CI_EXAMPLE_KEY }}
+        run: python -m pytest e2e -q --base-url http://127.0.0.1:8000
+      - name: Log del producto
+        if: always()
+        run: cat server.log
+
+  # Etapa 4: la imagen de Docker se construye
+  docker:
+    needs: e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: docker build
+        run: docker build -t hr-assistant:ci .

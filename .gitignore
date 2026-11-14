@@ -1,0 +1,19 @@
+# Secretos: nunca van al repositorio (.env.example sí, porque no tiene valores)
+.env
+.env.*
+!.env.example
+
+# Entornos virtuales
+.venv/
+venv/
+
+# Cachés y cobertura
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.pylint.d/
+.coverage
+.coverage.*
+htmlcov/
+test-results/
