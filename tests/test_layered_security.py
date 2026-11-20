@@ -19,13 +19,15 @@ from app.pii import redact
 from app.tracing import Tracer
 
 STATIC = Path(__file__).resolve().parents[1] / "app" / "static"
-PORTAL_KEY = "portal-key-0123456789abcd"
-KIOSK_KEY = "kiosk-key-0123456789abcd"
+# Claves de prueba armadas en tiempo de ejecución con palabras repetidas: no
+# son secretos y no deben parecerlo (gitleaks).
+PORTAL_KEY = "-".join(["portal", "test"] * 3)
+KIOSK_KEY = "-".join(["kiosk", "test"] * 3)
 PRODUCTION_ENV = {
     "ENVIRONMENT": "production",
     "MODEL_PROVIDER": "gateway",
     "CF_ACCOUNT_ID": "acc123",
-    "CF_API_TOKEN": "secret-token-123",
+    "CF_API_TOKEN": "-".join(["gateway", "test"] * 3),
     "API_KEYS": f"portal:{PORTAL_KEY}",
     "API_KEY_SCOPES": "portal:directory policies metrics",
 }

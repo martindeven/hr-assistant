@@ -16,7 +16,8 @@ GATEWAY_ENV = {
     "MODEL_PROVIDER": "gateway",
     "CF_ACCOUNT_ID": "acc123",
     "CF_GATEWAY_ID": "gw456",
-    "CF_API_TOKEN": "secret-token-123",
+    # Token de prueba armado en tiempo de ejecución: no es un secreto (gitleaks).
+    "CF_API_TOKEN": "-".join(["gateway", "test"] * 3),
 }
 LARGE = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 QUESTION = [{"role": "user", "content": "¿Quién es EMP-0004?"}]

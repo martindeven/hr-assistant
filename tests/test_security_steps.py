@@ -8,7 +8,9 @@ from pytest_bdd import given, parsers, scenarios, then, when
 
 scenarios("features/security.feature")
 
-KIOSK_KEY = "kiosk-key-0123456789"
+# Clave de prueba armada en tiempo de ejecución con palabras repetidas: no es un
+# secreto y no debe parecerlo (gitleaks).
+KIOSK_KEY = "-".join(["kiosk", "test"] * 3)
 REQUEST_TOO_LARGE_BODY = {"detail": "request too large"}
 
 

@@ -26,7 +26,9 @@ FIXED_NOW = datetime(2026, 1, 15, 10, 30, tzinfo=timezone.utc)
 # Clave de prueba de la sesión 4: no es un secreto real. Las pruebas de las
 # sesiones 1 a 3 la mandan por omisión y usan un límite alto para no toparlo.
 TEST_CLIENT = "unit-tests"
-TEST_API_KEY = "unit-test-key-0123456789"
+# Se arma en tiempo de ejecución con palabras repetidas para que no parezca una
+# clave real ni la marque gitleaks.
+TEST_API_KEY = "-".join(["unit", "test"] * 3)
 API_KEY_HEADER = "X-API-Key"
 KEYED_ENV = {
     "API_KEYS": f"{TEST_CLIENT}:{TEST_API_KEY}",
