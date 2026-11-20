@@ -20,25 +20,37 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, StringConstraints
 
+from app.agent_steps import StepRecorder
+from app.alerts import AlertThresholds
 from app.audit import AUDIT_TEXT_LIMIT, Auditor, audit_args
+from app.budget import BudgetExceeded, ClientBudget
 from app.clock import SystemClock
 from app.config import load_settings
 from app.directory import EmployeeDirectory
 from app.guard import Guard, GuardBlocked
-from app.http_layers import install_body_limit, install_security_headers
+from app.http_layers import (
+    build_page_csp,
+    install_body_limit,
+    install_security_headers,
+)
 from app.llm import ModelUnavailableError, build_models
 from app.logs import JsonLogger
 from app.metrics import MetricsRecorder
 from app.middleware import install_observability
 from app.pipeline import (
+    CostLevers,
     Forbidden,
     Pipeline,
     PipelineDependencies,
+    PipelineResult,
     window_history,
 )
 from app.policies import PolicyBook
 from app.pricing import PriceTable
+from app.prometheus import CONTENT_TYPE as PROMETHEUS_CONTENT_TYPE
+from app.prometheus import render as render_prometheus
 from app.ratelimit import RateLimiter
+from app.response_cache import ResponseCache
 from app.scopes import PERMISSIONS, permissions_for
 from app.security import ApiKeyAuthenticator, install_security
 from app.specialists import build_specialists
@@ -59,6 +71,7 @@ __all__ = [
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 INDEX_HTML_PATH = STATIC_DIR / "index.html"
+DASHBOARD_HTML_PATH = STATIC_DIR / "dashboard.html"
 STATIC_FILES = {
     "app.js": "text/javascript; charset=utf-8",
     "app.css": "text/css; charset=utf-8",
@@ -71,6 +84,9 @@ MODEL_UNAVAILABLE_DETAIL = "model unavailable"
 BLOCKED_STATUS = 400
 FORBIDDEN_STATUS = 403
 FORBIDDEN_DETAIL = "forbidden for this client"
+BUDGET_EXCEEDED_STATUS = 429
+BUDGET_EXCEEDED_DETAIL = "cost budget exceeded"
+RETRY_AFTER_HEADER = "Retry-After"
 CACHE_CONTROL_HEADER = "Cache-Control"
 NO_STORE = "no-store"
 READY_OK = "ok"
@@ -137,6 +153,9 @@ class AskResponse(BaseModel):
     :type guardrails: Guardrails
     :param fallback: ``True`` si respondió ``MODEL_SMALL`` por respaldo
     :type fallback: bool
+    :param cache: ``none``, ``gateway`` (alguna llamada vino de la caché del
+        gateway) o ``response`` (vino de la caché de respuestas)
+    :type cache: str
     """
 
     answer: str
@@ -152,6 +171,7 @@ class AskResponse(BaseModel):
     agents: list[str]
     guardrails: Guardrails
     fallback: bool
+    cache: Literal["none", "gateway", "response"]
 
 
 def _build_ask_request(settings):
@@ -229,6 +249,7 @@ def _default_tracer(settings):
         enabled=settings.tracing_enabled,
         hide_inputs=settings.hide_inputs,
         hide_outputs=settings.hide_outputs,
+        project_name=settings.langsmith_project,
     )
 
 
@@ -308,10 +329,17 @@ def _add_static_routes(application, settings):
         for name in STATIC_FILES
     }
 
+    dashboard_html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+
     @application.get("/", response_class=HTMLResponse)
     def home():
         """Sirve la página web de RH."""
         return HTMLResponse(index_html)
+
+    @application.get("/dashboard", response_class=HTMLResponse)
+    def dashboard():
+        """Sirve el tablero (pública); sus datos piden clave, como en ``/``."""
+        return HTMLResponse(dashboard_html)
 
     @application.get("/static/app.js")
     def script():
@@ -350,9 +378,19 @@ def _add_read_routes(application, metrics, checks):
         """Devuelve las métricas de este proceso, el costo y si se cumple el SLO."""
         return metrics.snapshot(pid=os.getpid())
 
+    @application.get("/metrics/prometheus")
+    def prometheus_endpoint():
+        """Devuelve las métricas de este proceso en el formato de Prometheus."""
+        return Response(
+            render_prometheus(metrics.prometheus_counters(), os.getpid()),
+            media_type=PROMETHEUS_CONTENT_TYPE,
+        )
 
+
+# Registro plano de dependencias inyectadas: cada una es un campo que se lee por
+# nombre, así que pasa del límite de atributos de pylint.
 @dataclass(frozen=True)
-class AskDependencies:
+class AskDependencies:  # pylint: disable=too-many-instance-attributes
     """Dependencias que usa ``POST /ask`` para responder.
 
     :param settings: Configuración de la aplicación
@@ -369,6 +407,11 @@ class AskDependencies:
     :type auditor: app.audit.Auditor
     :param metrics: Métricas del proceso
     :type metrics: app.metrics.MetricsRecorder
+    :param clock: Reloj inyectado (mide cada agente)
+    :type clock: app.clock.Clock
+    :param budget: Presupuesto diario por cliente (suma cada respuesta
+        ``200``); ``None`` no suma nada
+    :type budget: app.budget.ClientBudget or None
     """
 
     settings: object
@@ -378,6 +421,8 @@ class AskDependencies:
     logger: JsonLogger
     auditor: Auditor
     metrics: MetricsRecorder
+    clock: object
+    budget: object = None
 
 
 def _log_agent_run(logger, request_id, payload, run):
@@ -413,10 +458,11 @@ def _log_agent_run(logger, request_id, payload, run):
         agents=list(outcome.agents),
         fallback=outcome.fallback,
         review=outcome.guardrails["review"],
+        cache=outcome.cache,
     )
 
 
-def _error_response(status, detail, request_id):
+def _error_response(status, detail, request_id, headers=None):
     """Arma una respuesta de error de ``POST /ask`` con el id de la petición.
 
     :param status: Código HTTP
@@ -425,13 +471,15 @@ def _error_response(status, detail, request_id):
     :type detail: str
     :param request_id: Id de la petición
     :type request_id: str
+    :param headers: Encabezados extra (por ejemplo ``Retry-After``)
+    :type headers: dict[str, str] or None
     :return: La respuesta, sin caché
     :rtype: fastapi.responses.JSONResponse
     """
     return JSONResponse(
         status_code=status,
         content={"detail": detail, "request_id": request_id},
-        headers={CACHE_CONTROL_HEADER: NO_STORE},
+        headers={CACHE_CONTROL_HEADER: NO_STORE, **(headers or {})},
     )
 
 
@@ -462,6 +510,7 @@ def _build_response(outcome, request_id, cost_usd):
         agents=list(outcome.agents),
         guardrails=Guardrails(**outcome.guardrails),
         fallback=outcome.fallback,
+        cache=outcome.cache,
     )
 
 
@@ -476,44 +525,140 @@ def _answer(deps, payload, request_id, client):
     :type request_id: str
     :param client: Nombre del cliente que preguntó (nunca su clave)
     :type client: str or None
-    :return: La respuesta, o un ``400``, ``403`` o ``502``
+    :return: La respuesta, o un ``400``, ``403``, ``429`` o ``502``
     :rtype: AskResponse or fastapi.responses.JSONResponse
     """
-    audit = deps.auditor.bind(request_id, client)
-    history = [message.model_dump() for message in payload.history]
-    try:
-        with deps.tracer.run_context(request_id, client=client):
-            outcome = deps.pipeline.answer(
-                payload.question,
-                history,
-                client_permissions(deps.settings, client),
-                audit,
+    environment = deps.settings.environment
+    steps = StepRecorder(deps.clock, deps.tracer, environment)
+    with deps.tracer.run_context(request_id, client=client):
+        with deps.tracer.request_span(request_id, client, environment) as root:
+            try:
+                outcome = _run_pipeline(deps, payload, request_id, client, steps)
+            finally:
+                _record_steps(deps, steps, request_id, client)
+                root.annotate(agents=steps.ran())
+            if not isinstance(outcome, PipelineResult):
+                return outcome
+            result = outcome.result
+            cost_usd = deps.prices.cost_usd(
+                outcome.model, result.billed_input_tokens, result.billed_output_tokens
             )
-    except GuardBlocked as blocked:
-        return _error_response(BLOCKED_STATUS, blocked.detail, request_id)
-    except Forbidden:
-        return _error_response(FORBIDDEN_STATUS, FORBIDDEN_DETAIL, request_id)
-    except ModelUnavailableError as error:
-        # Al log solo va el tipo de error: el mensaje no debe llegar al log.
-        deps.logger.emit("error", request_id, error_type=type(error).__name__)
-        return _error_response(
-            MODEL_UNAVAILABLE_STATUS, MODEL_UNAVAILABLE_DETAIL, request_id
-        )
-    result = outcome.result
-    cost_usd = deps.prices.cost_usd(
-        outcome.model, result.billed_input_tokens, result.billed_output_tokens
-    )
+            root.annotate(
+                model=outcome.model,
+                route=outcome.route.reason,
+                agents=list(outcome.agents),
+                cost_usd=cost_usd,
+                cache=outcome.cache,
+                fallback=outcome.fallback,
+            )
     _log_agent_run(
         deps.logger,
         request_id,
         payload,
         {"outcome": outcome, "cost_usd": cost_usd, "client": client},
     )
-    deps.metrics.add_tokens(
+    _record_answer(deps.metrics, outcome, cost_usd, client)
+    if deps.budget is not None:
+        deps.budget.add(client, cost_usd)
+    return _build_response(outcome, request_id, cost_usd)
+
+
+def _run_pipeline(deps, payload, request_id, client, steps):
+    """Pasa la pregunta por los agentes y traduce sus errores a respuestas.
+
+    :param deps: Dependencias de ``POST /ask``
+    :type deps: AskDependencies
+    :param payload: Cuerpo validado de ``POST /ask``
+    :type payload: pydantic.BaseModel
+    :param request_id: Id de la petición
+    :type request_id: str
+    :param client: Nombre del cliente que preguntó (nunca su clave)
+    :type client: str or None
+    :param steps: Pasos medidos de la petición
+    :type steps: app.agent_steps.StepRecorder
+    :return: El resultado del pipeline, o un ``400``, ``403``, ``429``
+        (presupuesto, con ``Retry-After``) o ``502``
+    :rtype: app.pipeline.PipelineResult or fastapi.responses.JSONResponse
+    """
+    history = [message.model_dump() for message in payload.history]
+    try:
+        return deps.pipeline.answer(
+            payload.question,
+            history,
+            client_permissions(deps.settings, client),
+            deps.auditor.bind(request_id, client),
+            steps=steps,
+            client=client,
+        )
+    except GuardBlocked as blocked:
+        return _error_response(BLOCKED_STATUS, blocked.detail, request_id)
+    except Forbidden:
+        return _error_response(FORBIDDEN_STATUS, FORBIDDEN_DETAIL, request_id)
+    except BudgetExceeded as exceeded:
+        return _error_response(
+            BUDGET_EXCEEDED_STATUS,
+            BUDGET_EXCEEDED_DETAIL,
+            request_id,
+            headers={RETRY_AFTER_HEADER: str(exceeded.retry_after)},
+        )
+    except ModelUnavailableError as error:
+        # Al log solo va el tipo de error: el mensaje no debe llegar al log.
+        deps.logger.emit("error", request_id, error_type=type(error).__name__)
+        return _error_response(
+            MODEL_UNAVAILABLE_STATUS, MODEL_UNAVAILABLE_DETAIL, request_id
+        )
+
+
+def _record_steps(deps, steps, request_id, client):
+    """Escribe un ``agent_step`` por agente y lo suma a las métricas.
+
+    :param deps: Dependencias de ``POST /ask``
+    :type deps: AskDependencies
+    :param steps: Pasos medidos de la petición
+    :type steps: app.agent_steps.StepRecorder
+    :param request_id: Id de la petición
+    :type request_id: str
+    :param client: Nombre del cliente, o ``None``
+    :type client: str or None
+    """
+    for step in steps.steps:
+        deps.logger.emit(
+            "agent_step",
+            request_id,
+            client=client,
+            agent=step.agent,
+            latency_ms=step.latency_ms,
+            outcome=step.outcome,
+        )
+        deps.metrics.record_agent(step.agent, step.outcome, step.latency_ms)
+
+
+def _record_answer(metrics, outcome, cost_usd, client):
+    """Suma una respuesta ``200`` a las métricas técnicas y de negocio.
+
+    :param metrics: Métricas del proceso
+    :type metrics: app.metrics.MetricsRecorder
+    :param outcome: Resultado del pipeline
+    :type outcome: app.pipeline.PipelineResult
+    :param cost_usd: Costo de la respuesta en USD
+    :type cost_usd: float
+    :param client: Nombre del cliente, o ``None``
+    :type client: str or None
+    """
+    result = outcome.result
+    metrics.add_tokens(
         input_tokens=result.input_tokens, output_tokens=result.output_tokens
     )
-    deps.metrics.add_cost(cost_usd)
-    return _build_response(outcome, request_id, cost_usd)
+    metrics.add_cost(cost_usd)
+    metrics.record_answer(
+        client=client,
+        model=outcome.model,
+        route=outcome.route.reason,
+        cost_usd=cost_usd,
+        calls=result.steps,
+        cache=outcome.cache,
+        fallback=outcome.fallback,
+    )
 
 
 def _add_ask_route(application, deps):
@@ -538,7 +683,7 @@ def _add_ask_route(application, deps):
         )
 
 
-def _build_pipeline(settings, models, data, tracer):
+def _build_pipeline(settings, models, data, tracer, levers):
     """Arma el pipeline de agentes.
 
     :param settings: Configuración de la aplicación
@@ -549,6 +694,8 @@ def _build_pipeline(settings, models, data, tracer):
     :type data: tuple[app.directory.EmployeeDirectory, app.policies.PolicyBook]
     :param tracer: Trazas de los agentes
     :type tracer: app.tracing.Tracer
+    :param levers: Caché de respuestas y presupuesto por cliente
+    :type levers: app.pipeline.CostLevers
     :return: El pipeline
     :rtype: app.pipeline.Pipeline
     """
@@ -562,7 +709,27 @@ def _build_pipeline(settings, models, data, tracer):
             policy_book=policy_book,
             models=models,
             tracer=tracer,
-        )
+        ),
+        levers=levers,
+    )
+
+
+def _build_metrics(settings):
+    """Crea las métricas del proceso con los umbrales de las alertas.
+
+    :param settings: Configuración con ``SLO_P95_MS`` y ``ALERT_*``
+    :type settings: app.config.Settings
+    :return: Las métricas
+    :rtype: app.metrics.MetricsRecorder
+    """
+    return MetricsRecorder(
+        slo_p95_ms=settings.slo_p95_ms,
+        thresholds=AlertThresholds(
+            slo_p95_ms=settings.slo_p95_ms,
+            error_rate=settings.alert_error_rate,
+            cost_per_request_usd=settings.alert_cost_per_request_usd,
+            guardrail_events=settings.alert_guardrail_events,
+        ),
     )
 
 
@@ -618,20 +785,37 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     models = _resolve_models(
         settings, directory, model, models, (http_client, policy_book)
     )
-    pipeline = _build_pipeline(settings, models, (directory, policy_book), tracer)
+    # Palancas de costo del reto (parte 2): las dos son del proceso.
+    budget = ClientBudget(daily_usd=settings.client_daily_budget_usd, clock=clock)
+    response_cache = ResponseCache(
+        ttl_seconds=settings.response_cache_ttl_seconds,
+        max_entries=settings.response_cache_max_entries,
+        clock=clock,
+    )
+    pipeline = _build_pipeline(
+        settings,
+        models,
+        (directory, policy_book),
+        tracer,
+        CostLevers(response_cache=response_cache, budget=budget),
+    )
     logger = JsonLogger(
         stream=log_stream or sys.stdout,
         clock=clock,
         service=settings.service_name,
     )
+    metrics = _build_metrics(settings)
     deps = AskDependencies(
         settings=settings,
         pipeline=pipeline,
         prices=PriceTable.load(settings.prices_path),
         tracer=tracer,
         logger=logger,
-        auditor=Auditor(logger),
-        metrics=MetricsRecorder(slo_p95_ms=settings.slo_p95_ms),
+        # ``guardrails`` sale de la misma fuente que el audit.
+        auditor=Auditor(logger, observer=metrics.observe_audit),
+        metrics=metrics,
+        clock=clock,
+        budget=budget,
     )
     # Si algo no carga, ``create_app`` falla antes; aquí todo está listo.
     checks = {"directory": READY_OK, "policies": READY_OK, "prices": READY_OK}
@@ -652,7 +836,11 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-locals
     install_observability(
         application, deps.logger, deps.metrics, clock, new_id or new_request_id
     )
-    install_security_headers(application, settings.environment)
+    install_security_headers(
+        application,
+        settings.environment,
+        page_csp=build_page_csp(DASHBOARD_HTML_PATH.read_text(encoding="utf-8")),
+    )
     _add_static_routes(application, settings)
     _add_read_routes(application, deps.metrics, checks)
     _add_ask_route(application, deps)

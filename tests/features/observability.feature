@@ -29,7 +29,7 @@ Feature: Every request can be traced and measured
   Scenario: A question leaves a full trail in the log without personal data
     Given the HR assistant is running with an in-memory log
     When I ask "¿Quién es EMP-0004?" with the request id "demo-123"
-    Then the log has the events "audit, agent_run, request" for "demo-123"
+    Then the log has the events "audit, agent_step, agent_step, agent_step, agent_step, agent_run, request" for "demo-123"
     And the audit event records the tool "get_employee" with its arguments
     And the agent_run event counts the question without its text
     And no log line contains the question or the answer

@@ -51,6 +51,13 @@ PII_INPUT_MODES = ("redact", "block", "off")
 DEFAULT_INJECTION_GUARD = "true"
 DEFAULT_MAX_ANSWER_CHARS = "1500"
 DEFAULT_MAX_BODY_BYTES = "65536"
+DEFAULT_LANGSMITH_PROJECT = "hr-assistant"
+DEFAULT_RESPONSE_CACHE_TTL_SECONDS = "0"
+DEFAULT_RESPONSE_CACHE_MAX_ENTRIES = "512"
+DEFAULT_CLIENT_DAILY_BUDGET_USD = "0"
+DEFAULT_ALERT_ERROR_RATE = "0.05"
+DEFAULT_ALERT_COST_PER_REQUEST_USD = "0.001"
+DEFAULT_ALERT_GUARDRAIL_EVENTS = "10"
 
 
 # Es un registro plano e inmutable de variables de entorno: cada variable es un
@@ -133,6 +140,24 @@ class Settings:  # pylint: disable=too-many-instance-attributes
     :param api_key_scopes: Permisos de cada cliente; nombra a los clientes, así
         que no sale en ``repr``
     :type api_key_scopes: dict[str, frozenset[str]]
+    :param langsmith_project: Proyecto de LangSmith de las trazas
+    :type langsmith_project: str
+    :param response_cache_ttl_seconds: Segundos de la caché de respuestas (0:
+        apagada)
+    :type response_cache_ttl_seconds: int
+    :param response_cache_max_entries: Entradas máximas de la caché de
+        respuestas
+    :type response_cache_max_entries: int
+    :param client_daily_budget_usd: Tope de costo diario por cliente (0: sin
+        tope)
+    :type client_daily_budget_usd: float
+    :param alert_error_rate: Umbral de la alerta ``error_rate_high``
+    :type alert_error_rate: float
+    :param alert_cost_per_request_usd: Umbral de la alerta
+        ``cost_per_request_high``
+    :type alert_cost_per_request_usd: float
+    :param alert_guardrail_events: Umbral de la alerta ``guardrail_spike``
+    :type alert_guardrail_events: int
     """
 
     model_provider: str
@@ -171,6 +196,86 @@ class Settings:  # pylint: disable=too-many-instance-attributes
     max_answer_chars: int = int(DEFAULT_MAX_ANSWER_CHARS)
     max_body_bytes: int = int(DEFAULT_MAX_BODY_BYTES)
     api_key_scopes: dict = field(default_factory=dict, repr=False, compare=False)
+    langsmith_project: str = DEFAULT_LANGSMITH_PROJECT
+    response_cache_ttl_seconds: int = int(DEFAULT_RESPONSE_CACHE_TTL_SECONDS)
+    response_cache_max_entries: int = int(DEFAULT_RESPONSE_CACHE_MAX_ENTRIES)
+    client_daily_budget_usd: float = float(DEFAULT_CLIENT_DAILY_BUDGET_USD)
+    alert_error_rate: float = float(DEFAULT_ALERT_ERROR_RATE)
+    alert_cost_per_request_usd: float = float(DEFAULT_ALERT_COST_PER_REQUEST_USD)
+    alert_guardrail_events: int = int(DEFAULT_ALERT_GUARDRAIL_EVENTS)
+
+
+def _non_negative_number(env, name, default):
+    """Lee una variable como decimal finito de 0 en adelante.
+
+    :param env: Mapeo de variables de entorno
+    :type env: Mapping[str, str]
+    :param name: Nombre de la variable
+    :type name: str
+    :param default: Valor por omisión, como texto
+    :type default: str
+    :return: El número leído
+    :rtype: float
+    :raises ConfigError: Si no es un número finito mayor o igual que cero
+    """
+    raw = env.get(name, default)
+    try:
+        value = float(str(raw).strip())
+    except ValueError as error:
+        raise ConfigError(
+            f"{name} must be a non-negative number, got {raw!r}"
+        ) from error
+    # ``isfinite`` descarta ``nan`` e ``inf``, que ``float`` acepta.
+    if not (math.isfinite(value) and value >= 0):
+        raise ConfigError(f"{name} must be a non-negative number, got {raw!r}")
+    return value
+
+
+def _langsmith_project(env):
+    """Lee ``LANGSMITH_PROJECT`` y comprueba que no esté vacío.
+
+    :param env: Mapeo de variables de entorno
+    :type env: Mapping[str, str]
+    :return: El nombre del proyecto
+    :rtype: str
+    :raises ConfigError: Si está vacío
+    """
+    value = _text(env, "LANGSMITH_PROJECT", DEFAULT_LANGSMITH_PROJECT)
+    if not value:
+        raise ConfigError("LANGSMITH_PROJECT must not be empty")
+    return value
+
+
+def _observability_fields(env):
+    """Lee las variables de trazas, alertas, caché de respuestas y presupuesto.
+
+    :param env: Mapeo de variables de entorno
+    :type env: Mapping[str, str]
+    :return: Los campos de ``Settings`` por nombre
+    :rtype: dict
+    :raises ConfigError: Si alguna variable tiene un valor inválido
+    """
+    return {
+        "langsmith_project": _langsmith_project(env),
+        "response_cache_ttl_seconds": _non_negative_int(
+            env, "RESPONSE_CACHE_TTL_SECONDS", DEFAULT_RESPONSE_CACHE_TTL_SECONDS
+        ),
+        "response_cache_max_entries": _positive_int(
+            env, "RESPONSE_CACHE_MAX_ENTRIES", DEFAULT_RESPONSE_CACHE_MAX_ENTRIES
+        ),
+        "client_daily_budget_usd": _non_negative_number(
+            env, "CLIENT_DAILY_BUDGET_USD", DEFAULT_CLIENT_DAILY_BUDGET_USD
+        ),
+        "alert_error_rate": _non_negative_number(
+            env, "ALERT_ERROR_RATE", DEFAULT_ALERT_ERROR_RATE
+        ),
+        "alert_cost_per_request_usd": _non_negative_number(
+            env, "ALERT_COST_PER_REQUEST_USD", DEFAULT_ALERT_COST_PER_REQUEST_USD
+        ),
+        "alert_guardrail_events": _non_negative_int(
+            env, "ALERT_GUARDRAIL_EVENTS", DEFAULT_ALERT_GUARDRAIL_EVENTS
+        ),
+    }
 
 
 def _data_path(env, name, default):
@@ -615,4 +720,5 @@ def _build_settings(env):
         policies_path=_data_path(env, "POLICIES_PATH", DEFAULT_POLICIES_PATH),
         **_resilience_fields(env),
         **_guardrail_fields(env),
+        **_observability_fields(env),
     )

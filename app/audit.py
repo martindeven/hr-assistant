@@ -54,10 +54,14 @@ class Auditor:
 
     :param logger: Log JSON de eventos
     :type logger: app.logs.JsonLogger
+    :param observer: Función ``(action, outcome, fields)`` que recibe cada
+        evento (las métricas cuentan ``guardrails`` con ella); opcional
+    :type observer: collections.abc.Callable or None
     """
 
-    def __init__(self, logger):
+    def __init__(self, logger, observer=None):
         self._logger = logger
+        self._observer = observer
 
     def emit(self, action, outcome, request_id, client, **fields):
         """Escribe un evento ``audit``.
@@ -85,6 +89,8 @@ class Auditor:
             outcome=outcome,
             **fields,
         )
+        if self._observer is not None:
+            self._observer(action, outcome, dict(fields))
 
     def bind(self, request_id, client):
         """Crea un auditor fijo para una petición.

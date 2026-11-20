@@ -1,12 +1,13 @@
-"""Pruebas de punta a punta de la página del HR Assistant (spec/03 a spec/05).
+"""Pruebas de punta a punta de la página y del tablero (spec/03 a spec/06).
 
 Corren en el navegador contra el producto vivo con el modelo simulado. La URL
 base la pone ``verification e2e`` con ``--base-url``, y la clave del cliente
 llega en la variable ``E2E_API_KEY``: nunca se escribe en la prueba.
 
-El tope es de seis pruebas: las de las sesiones 3 y 4 se juntaron en tres para
-dejar lugar a las tres de la parte 1 del reto (agentes, aviso de datos
-sensibles y bloqueo de inyección).
+El tope es de seis pruebas: las de las sesiones 3 y 4 se juntaron en dos (la
+pregunta vacía y la clave equivocada comparten prueba) para dejar lugar a las
+tres de la parte 1 del reto (agentes, aviso de datos sensibles y bloqueo de
+inyección) y a la del tablero de la parte 2.
 """
 
 import os
@@ -25,6 +26,9 @@ WRONG_KEY_SUFFIX = "-not-a-valid-key"
 EMPTY_QUESTION_ERROR = "Error: escribe una pregunta."
 SENSITIVE_DATA_NOTICE = "Se ocultaron datos sensibles"
 BLOCKED_QUESTION_MESSAGE = "La pregunta no se puede procesar"
+# La tarjeta de peticiones: la etiqueta y, antes del siguiente número, un
+# conteo que no empieza en cero (es decir, mayor que cero).
+REQUESTS_ABOVE_ZERO = re.compile(r"peticiones\D{0,40}?[1-9]", re.IGNORECASE)
 
 
 def _api_key() -> str:
@@ -100,9 +104,13 @@ def test_two_questions_show_both_answers_in_order_and_keep_the_key_in_session(
     assert api_key not in page.content()
 
 
-def test_an_empty_or_blank_question_shows_a_spanish_error_and_no_answer(page: Page):
-    """La caja vacía o solo con espacios muestra un error en español."""
-    _open_page_with_key(page, _api_key())
+def test_an_empty_question_or_a_wrong_key_shows_an_error_and_no_answer(page: Page):
+    """Errores de entrada: ninguno muestra una respuesta del asistente.
+
+    La caja vacía o solo con espacios muestra un error en español, y una
+    clave equivocada muestra «Clave inválida».
+    """
+    _open_page_with_key(page, _api_key() + WRONG_KEY_SUFFIX)
     answer = page.get_by_test_id("answer")
 
     page.get_by_test_id("send").click()
@@ -111,16 +119,8 @@ def test_an_empty_or_blank_question_shows_a_spanish_error_and_no_answer(page: Pa
     _ask(page, "   ")
     error = re.escape(EMPTY_QUESTION_ERROR)
     expect(answer).to_contain_text(re.compile(error + r".*" + error, re.DOTALL))
-    expect(answer).not_to_contain_text("Asistente:")
-
-
-def test_a_wrong_api_key_shows_invalid_key_and_no_answer(page: Page):
-    """Una clave equivocada muestra «Clave inválida» y ninguna respuesta."""
-    _open_page_with_key(page, _api_key() + WRONG_KEY_SUFFIX)
 
     _ask(page, FIRST_QUESTION)
-
-    answer = page.get_by_test_id("answer")
     expect(answer).to_contain_text("Clave inválida")
     expect(answer).not_to_contain_text("Asistente:")
 
@@ -158,3 +158,25 @@ def test_a_prompt_injection_shows_that_the_question_cannot_be_processed(page: Pa
     answer = page.get_by_test_id("answer")
     expect(answer).to_contain_text(BLOCKED_QUESTION_MESSAGE)
     expect(answer).not_to_contain_text("Asistente:")
+
+
+def test_after_a_question_the_dashboard_shows_its_cards_and_counts_requests(
+    page: Page,
+):
+    """Tras una pregunta en ``/``, el tablero cuenta peticiones (spec/06).
+
+    La clave se escribe solo en ``/``; el tablero, en la misma pestaña, la lee
+    de sessionStorage. ``expect`` espera la primera lectura de ``/metrics``,
+    que ocurre al cargar, sin depender del refresco de 10 segundos.
+    """
+    _open_page_with_key(page, _api_key())
+    _ask(page, EMPLOYEE_QUESTION)
+    expect(page.get_by_test_id("answer")).to_contain_text(REQUEST_ID_LINE)
+
+    page.goto("/dashboard")
+
+    expect(page.get_by_test_id("api-key")).to_be_visible()
+    expect(page.get_by_test_id("alerts")).to_be_attached()
+    cards = page.get_by_test_id("dashboard")
+    expect(cards).to_be_visible()
+    expect(cards).to_contain_text(REQUESTS_ABOVE_ZERO)

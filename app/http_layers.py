@@ -8,7 +8,10 @@ límite (``429``) y tamaño (``413``) antes de validar el cuerpo (``422``), y lo
 encabezados llegan también a los ``401``, ``413`` y ``500``.
 """
 
+import base64
+import hashlib
 import json
+import re
 
 PRODUCTION_ENVIRONMENT = "production"
 HTTP_SCOPE = "http"
@@ -24,13 +27,60 @@ ALWAYS_HEADERS = (
     (b"referrer-policy", b"no-referrer"),
 )
 PAGE_PATH = "/"
+DASHBOARD_PATH = "/dashboard"
+PAGE_PATHS = frozenset({PAGE_PATH, DASHBOARD_PATH})
+CSP_HEADER = b"content-security-policy"
 PAGE_CSP = (
-    b"content-security-policy",
+    CSP_HEADER,
     b"default-src 'self'; frame-ancestors 'none'",
 )
+INLINE_BLOCK = r"<{tag}(?:\s[^>]*)?>(.*?)</{tag}>"
 ASK_PATH = "/ask"
 NO_STORE = (b"cache-control", b"no-store")
 HSTS = (b"strict-transport-security", b"max-age=31536000; includeSubDomains")
+
+
+class PageCspError(ValueError):
+    """La página del tablero no tiene exactamente un ``<script>`` y un ``<style>``."""
+
+
+def _inline_hash(html, tag):
+    """Calcula el hash de CSP del único bloque en línea de una etiqueta.
+
+    :param html: HTML de la página
+    :type html: str
+    :param tag: ``script`` o ``style``
+    :type tag: str
+    :return: El hash como ``'sha256-...'``
+    :rtype: str
+    :raises PageCspError: Si no hay exactamente un bloque de esa etiqueta
+    """
+    blocks = re.findall(INLINE_BLOCK.format(tag=tag), html, flags=re.DOTALL)
+    if len(blocks) != 1:
+        raise PageCspError(f"dashboard.html must have exactly one <{tag}> block")
+    digest = hashlib.sha256(blocks[0].encode("utf-8")).digest()
+    return f"'sha256-{base64.b64encode(digest).decode('ascii')}'"
+
+
+def build_page_csp(dashboard_html):
+    """Arma la CSP de ``/`` y ``/dashboard`` (la misma en las dos).
+
+    Solo permite el código en línea del tablero por su hash: nunca
+    ``'unsafe-inline'``. Se calcula al arrancar.
+
+    :param dashboard_html: HTML de ``static/dashboard.html``
+    :type dashboard_html: str
+    :return: El valor del encabezado ``Content-Security-Policy``
+    :rtype: str
+    :raises PageCspError: Si el HTML no tiene exactamente un ``<script>`` y un
+        ``<style>``
+    """
+    script_hash = _inline_hash(dashboard_html, "script")
+    style_hash = _inline_hash(dashboard_html, "style")
+    return (
+        f"default-src 'self'; script-src 'self' {script_hash}; "
+        f"style-src 'self' {style_hash}; frame-ancestors 'none'"
+    )
 
 
 def _declared_length(scope):
@@ -151,19 +201,25 @@ def _replay(messages, receive):
 class SecurityHeadersMiddleware:
     """Pone los encabezados de seguridad en toda respuesta.
 
-    Siempre ``nosniff``, ``DENY`` y ``no-referrer``; ``GET /`` lleva además la
-    CSP; ``/ask`` lleva ``Cache-Control: no-store`` (también en sus ``401``,
-    ``413`` y ``429``); en ``production`` toda respuesta lleva HSTS.
+    Siempre ``nosniff``, ``DENY`` y ``no-referrer``; ``GET /`` y
+    ``GET /dashboard`` llevan además la misma CSP; ``/ask`` lleva
+    ``Cache-Control: no-store`` (también en sus ``401``, ``413`` y ``429``); en
+    ``production`` toda respuesta lleva HSTS.
 
     :param app: Aplicación ASGI que envuelve
     :type app: collections.abc.Callable
     :param environment: ``development`` o ``production``
     :type environment: str
+    :param page_csp: CSP de las páginas; por omisión la de la sesión 4
+    :type page_csp: str or None
     """
 
-    def __init__(self, app, environment):
+    def __init__(self, app, environment, page_csp=None):
         self.app = app
         self.production = environment == PRODUCTION_ENVIRONMENT
+        self.page_csp = PAGE_CSP
+        if page_csp is not None:
+            self.page_csp = (CSP_HEADER, page_csp.encode("ascii"))
 
     def _extra_headers(self, scope):
         """Encabezados de una petición según su ruta y el ambiente.
@@ -175,8 +231,8 @@ class SecurityHeadersMiddleware:
         """
         headers = list(ALWAYS_HEADERS)
         path = scope.get("path", "")
-        if path == PAGE_PATH and scope.get("method") == "GET":
-            headers.append(PAGE_CSP)
+        if path in PAGE_PATHS and scope.get("method") == "GET":
+            headers.append(self.page_csp)
         if path == ASK_PATH:
             headers.append(NO_STORE)
         if self.production:
@@ -215,12 +271,17 @@ def install_body_limit(application, max_body_bytes):
     application.add_middleware(BodyLimitMiddleware, max_body_bytes=max_body_bytes)
 
 
-def install_security_headers(application, environment):
+def install_security_headers(application, environment, page_csp=None):
     """Instala los encabezados de seguridad (debe ser lo último en instalarse).
 
     :param application: Aplicación donde se instala
     :type application: fastapi.FastAPI
     :param environment: ``development`` o ``production``
     :type environment: str
+    :param page_csp: CSP de ``/`` y ``/dashboard`` (``build_page_csp``); por
+        omisión la de la sesión 4
+    :type page_csp: str or None
     """
-    application.add_middleware(SecurityHeadersMiddleware, environment=environment)
+    application.add_middleware(
+        SecurityHeadersMiddleware, environment=environment, page_csp=page_csp
+    )

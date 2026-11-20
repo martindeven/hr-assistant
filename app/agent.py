@@ -150,10 +150,20 @@ class Agent:
     :type tracer: app.tracing.Tracer or None
     :param specialist: Especialista (nombre, prompt y herramientas)
     :type specialist: app.specialists.Specialist or None
+    :param trace_loop: Si el bucle queda como nodo ``agent.run``; el pipeline
+        lo apaga porque el nodo del especialista ya lo abre ``StepRecorder``
+    :type trace_loop: bool
     """
 
     def __init__(  # pylint: disable=too-many-arguments
-        self, model, directory, max_steps, tracer=None, *, specialist=None
+        self,
+        model,
+        directory,
+        max_steps,
+        tracer=None,
+        *,
+        specialist=None,
+        trace_loop=True,
     ):
         self._max_steps = max_steps
         self._tracer = tracer
@@ -170,9 +180,10 @@ class Agent:
         self._tools = tools
         if tracer is not None:
             # Con el Tracer apagado, ``wrap`` devuelve la misma función.
-            self._traced_loop = tracer.wrap(
-                self._loop, name="agent.run", run_type="chain"
-            )
+            if trace_loop:
+                self._traced_loop = tracer.wrap(
+                    self._loop, name="agent.run", run_type="chain"
+                )
             self._tools = {
                 name: replace(
                     tool,

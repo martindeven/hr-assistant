@@ -7,6 +7,7 @@ dependan de las variables de entorno de quien las corre.
 import io
 import itertools
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -116,6 +117,46 @@ class FakeClock:
         value = self._value
         self._value += self._step
         return value
+
+
+class UtcClock:
+    """Reloj de prueba con la hora UTC que fija la prueba (reto, parte 2).
+
+    Sirve para el presupuesto diario: la prueba pone la hora cerca de la
+    medianoche y después la mueve al día siguiente. El contador monotónico no
+    avanza solo.
+
+    :param now: Hora UTC inicial
+    :type now: datetime.datetime
+    """
+
+    def __init__(self, now):
+        self.now = now
+        self._value = 100.0
+
+    def now_utc(self):
+        """Devuelve la hora UTC que fijó la prueba.
+
+        :return: La hora actual del reloj
+        :rtype: datetime.datetime
+        """
+        return self.now
+
+    def monotonic(self):
+        """Devuelve el contador sin avanzarlo.
+
+        :return: Segundos de un contador que nunca decrece
+        :rtype: float
+        """
+        return self._value
+
+    def advance(self, seconds):
+        """Avanza el contador monotónico.
+
+        :param seconds: Segundos que pasan
+        :type seconds: float
+        """
+        self._value += seconds
 
 
 class ExplodingModel:
@@ -268,6 +309,46 @@ def make_observed_client(directory):
 def manual_clock():
     """La clase del reloj manual, para crear uno por prueba."""
     return ManualClock
+
+
+PROMETHEUS_SAMPLE = re.compile(r"^([A-Za-z_:][A-Za-z0-9_:]*)(?:\{(.*)\})?\s+(\S+)$")
+PROMETHEUS_LABEL = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)="((?:[^"\\]|\\.)*)"')
+
+
+def parse_prometheus(text):
+    """Lee las muestras de un texto en formato de Prometheus 0.0.4.
+
+    Las líneas ``#`` (``HELP`` y ``TYPE``) y las vacías se saltan.
+
+    :param text: Cuerpo de ``GET /metrics/prometheus``
+    :type text: str
+    :return: Una tupla ``(nombre, etiquetas, valor)`` por muestra
+    :rtype: list[tuple[str, dict[str, str], float]]
+    :raises AssertionError: Si una línea no tiene la forma de una muestra
+    """
+    samples = []
+    for line in text.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        found = PROMETHEUS_SAMPLE.match(line)
+        assert found, f"not a Prometheus sample: {line!r}"
+        name, labels, value = found.groups()
+        samples.append(
+            (name, dict(PROMETHEUS_LABEL.findall(labels or "")), float(value))
+        )
+    return samples
+
+
+@pytest.fixture
+def prometheus_samples():
+    """La función que lee las muestras del texto de Prometheus."""
+    return parse_prometheus
+
+
+@pytest.fixture
+def utc_clock():
+    """La clase del reloj con hora UTC fija, para crear uno por prueba."""
+    return UtcClock
 
 
 @pytest.fixture

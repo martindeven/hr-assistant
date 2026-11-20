@@ -23,6 +23,12 @@ Desde el reto (parte 1) es un **sistema multiagente**: cada pregunta pasa por `g
 pequeño si el grande sigue fallando y corre con varios procesos (ver «Multiagente» y
 «Concurrencia y resiliencia»).
 
+Desde el reto (parte 2) cada agente es **visible de punta a punta**: un nodo por agente en la
+traza de LangSmith, un evento `agent_step` por agente en el log, métricas técnicas y de negocio
+en `GET /metrics` y `GET /metrics/prometheus`, cuatro alertas y un tablero en `/dashboard` (ver
+«Observabilidad»). Suma dos palancas de costo con su evidencia: la caché de respuestas y el
+presupuesto diario por cliente (ver «Costos» y `doc/cost-analysis.md`).
+
 La arquitectura y las decisiones (ADR) están en `doc/`.
 
 ## Cómo correrlo
@@ -48,12 +54,14 @@ uv run pytest tests --cov=app
 | Método y ruta | Clave | Qué hace |
 | --- | --- | --- |
 | `GET /` | No | Página web; muestra el `request_id` de cada respuesta para pasarlo a soporte |
+| `GET /dashboard` | No (sus datos sí) | Tablero: pide la clave, la guarda en `sessionStorage` y lee `/metrics` al cargar y cada 10 s |
 | `GET /health` | No | `{"status": "ok", "pid": ...}` |
 | `GET /ready` | No | `{"status": "ready", "checks": {"directory", "policies", "prices"}}`; no llama al modelo |
 | `GET /static/app.js`, `GET /static/app.css` | No | Código y estilos de la página (sin código en línea) |
 | `GET /docs` | No | Documentación interactiva de la API (usa `/openapi.json`, también pública) |
-| `POST /ask` | Sí | Recibe `{"question", "history"}` y devuelve `answer`, `steps`, `tools_used`, `input_tokens`, `output_tokens`, `request_id`, `model`, `route`, `cached_calls`, `cost_usd`, `agents`, `guardrails` y `fallback` |
-| `GET /metrics` | Sí, con permiso `metrics` | Métricas de este proceso: `pid`, `requests`, `error_rate`, `latency_ms` (`p50`, `p95`), `tokens`, `cost_usd` y `slo` |
+| `POST /ask` | Sí | Recibe `{"question", "history"}` y devuelve `answer`, `steps`, `tools_used`, `input_tokens`, `output_tokens`, `request_id`, `model`, `route`, `cached_calls`, `cost_usd`, `agents`, `guardrails`, `fallback` y `cache` (`none`, `gateway` o `response`) |
+| `GET /metrics` | Sí, con permiso `metrics` | Métricas de este proceso: `pid`, `requests`, `error_rate`, `latency_ms` (`p50`, `p95`), `tokens`, `cost_usd`, `slo`, `by_agent`, `by_client`, `by_model`, `by_route`, `guardrails`, `cache`, `fallbacks`, `cost_usd_per_request` y `alerts` |
+| `GET /metrics/prometheus` | Sí, con permiso `metrics` | Las mismas métricas en formato de texto de Prometheus (`text/plain; version=0.0.4`) |
 
 Cualquier otra ruta también pide clave (se niega por omisión).
 
@@ -128,8 +136,8 @@ encabezado `X-API-Key`; la página la pide en el campo «Clave de acceso» y la 
 - Sin clave, con una vacía o con una que no existe: `401 {"detail": "invalid or missing API key"}`.
   La clave se revisa antes que el cuerpo, así que sin clave nunca hay `422`.
 - Las claves se comparan con `hmac.compare_digest` contra todas, sin salir antes.
-- El nombre del cliente va en el campo `client` de los eventos `request`, `agent_run` y `audit`
-  y en los metadatos de la traza. **La clave nunca** se escribe en el log, la traza ni un error.
+- El nombre del cliente va en el campo `client` de los eventos `request`, `agent_step`,
+  `agent_run` y `audit`, en `by_client` de `/metrics` y en los metadatos de la traza. **La clave nunca** se escribe en el log, la traza ni un error.
 - Si `API_KEYS` está mal formada (entrada vacía, sin `:`, cliente o clave vacíos, cliente o
   clave repetidos), el producto no arranca. El error dice el número de entrada y su largo, por
   ejemplo `API_KEYS entry 2 is malformed (length 27)`, nunca el valor.
@@ -150,8 +158,10 @@ tabla de reglas está en `doc/compliance-checklist.md`.
 ## Seguridad en capas
 
 Una petición pasa por estos controles, en este orden: clave (`401`), límite (`429`), tamaño del
-cuerpo (`413`), validación (`422`), `guard` (`400`) y permisos (`403`). Después corren los
-especialistas, solo con sus herramientas, y al final el `reviewer`. El modelo de amenazas
+cuerpo (`413`), validación (`422`), `guard` (`400`), permisos (`403`) y presupuesto diario del
+cliente (`429 {"detail": "cost budget exceeded", "request_id": ...}` con `Retry-After`). Después
+se busca en la caché de respuestas y, si no hay acierto, corren los especialistas, solo con sus
+herramientas, y al final el `reviewer`. El modelo de amenazas
 (OWASP Top 10 para aplicaciones con LLM) está en `doc/security.md`.
 
 - **Datos personales.** El `guard` reconoce correo, teléfono (10 dígitos, `+52` opcional), CURP,
@@ -178,14 +188,19 @@ especialistas, solo con sus herramientas, y al final el `reviewer`. El modelo de
   `API_KEY_SCOPES="portal:directory policies metrics,kiosco:policies"`. Un kiosco solo con
   `policies` recibe `403` en una pregunta sin temas de política, porque esa va a `directory`.
 - **Encabezados.** Toda respuesta lleva `X-Content-Type-Options: nosniff`, `X-Frame-Options:
-  DENY` y `Referrer-Policy: no-referrer`; `/ask` además `Cache-Control: no-store`; `GET /`
-  lleva `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'`, y en
-  `production` toda respuesta lleva `Strict-Transport-Security`.
+  DENY` y `Referrer-Policy: no-referrer`; `/ask` además `Cache-Control: no-store`; `GET /` y
+  `GET /dashboard` llevan la misma `Content-Security-Policy: default-src 'self'; script-src
+  'self' 'sha256-...'; style-src 'self' 'sha256-...'; frame-ancestors 'none'`, y en
+  `production` toda respuesta lleva `Strict-Transport-Security`. Los dos hashes son los del
+  único `<script>` y el único `<style>` de `app/static/dashboard.html`: se calculan al arrancar
+  (si el archivo no tiene exactamente uno de cada uno, el producto no arranca) y nunca se usa
+  `'unsafe-inline'`. `index.html` sigue sin código en línea.
 - **Tamaño del cuerpo.** Un cuerpo de más de `MAX_BODY_BYTES` responde `413 {"detail":
   "request too large"}`: con `Content-Length` sin leerlo; sin él, se corta al pasar el tope.
 - **Auditoría.** Eventos `audit` de `tool_call`, `tool_denied`, `auth_failed` (`client: null` y
   `path`), `rate_limited`, `forbidden`, `pii_detected` (`where`, `types`, `count`),
-  `injection_blocked` (`rule`), `output_reviewed` (`rule`) y `fallback`. Ninguno lleva el texto
+  `injection_blocked` (`rule`), `output_reviewed` (`rule`), `fallback` y `budget_exceeded`
+  (`retry_after`). Ninguno lleva el texto
   de la pregunta, de la respuesta ni una clave; los `args` de `tool_call` van tapados y
   recortados.
 
@@ -271,6 +286,13 @@ producto nunca lee `.env`: las variables se pasan por el entorno.
 | `MAX_ANSWER_CHARS` | `1500` | Largo máximo de la respuesta |
 | `MAX_BODY_BYTES` | `65536` | Tamaño máximo del cuerpo de una petición |
 | `API_KEY_SCOPES` | (sin valor) | Permisos de cada cliente (`directory`, `policies`, `metrics`) |
+| `LANGSMITH_PROJECT` | `hr-assistant` | Proyecto de LangSmith de las trazas (no vacío) |
+| `ALERT_ERROR_RATE` | `0.05` | Umbral de la alerta `error_rate_high` (decimal de 0 en adelante) |
+| `ALERT_COST_PER_REQUEST_USD` | `0.001` | Umbral de la alerta `cost_per_request_high` (decimal de 0 en adelante) |
+| `ALERT_GUARDRAIL_EVENTS` | `10` | Umbral de la alerta `guardrail_spike` (entero de 0 en adelante) |
+| `RESPONSE_CACHE_TTL_SECONDS` | `0` | Caché de respuestas en segundos (0: apagada; entero de 0 en adelante) |
+| `RESPONSE_CACHE_MAX_ENTRIES` | `512` | Entradas máximas de la caché de respuestas (entero positivo) |
+| `CLIENT_DAILY_BUDGET_USD` | `0` | Tope de costo diario (UTC) por cliente en USD (0: sin tope; decimal de 0 en adelante) |
 
 Los booleanos aceptan solo `true` o `false` (sin distinguir mayúsculas). Un valor inválido
 detiene el arranque con un mensaje que nombra la variable. Sin `LANGSMITH_API_KEY`, las trazas
@@ -298,6 +320,30 @@ Las palancas: enrutamiento (`ROUTING`, `ROUTER_MAX_CHARS`), ventana de historial
 (`HISTORY_WINDOW`), tope de salida (`MODEL_MAX_TOKENS`) y caché del gateway
 (`CACHE_TTL_SECONDS`, con un TTL corto: un `HIT` puede traer datos de antes de un cambio).
 
+Desde el reto (parte 2) hay dos palancas más:
+
+- **Caché de respuestas.** Con `RESPONSE_CACHE_TTL_SECONDS` mayor que 0 se guarda cada respuesta
+  revisada durante ese tiempo; `render.yaml` la enciende con 300 s y por omisión está apagada.
+  La llave es la pregunta ya revisada por el `guard` y normalizada (sin mayúsculas, sin acentos,
+  espacios juntos), los especialistas permitidos al cliente y un hash del historial que se manda
+  al modelo: dos clientes con permisos distintos nunca comparten una respuesta. Guarda hasta
+  `RESPONSE_CACHE_MAX_ENTRIES` entradas y, al llenarse, saca la menos usada. Un acierto responde
+  con `"cache": "response"`, `"cost_usd": 0`, `"steps": 0`, `tools_used` vacío y su propio
+  `request_id`, sin llamar al modelo; los especialistas y el `reviewer` quedan `skipped`. El
+  `guard` corre antes, así que una inyección sigue dando `400`. No se guardan errores, respuestas
+  por tope de pasos, respuestas reemplazadas por el `reviewer` ni respuestas de respaldo.
+- **Presupuesto por cliente.** Con `CLIENT_DAILY_BUDGET_USD` mayor que 0, cuando el costo del día
+  (UTC) de un cliente alcanza el tope, sus siguientes preguntas responden `429 {"detail": "cost
+  budget exceeded", "request_id": ...}` con `Retry-After` (segundos hasta la medianoche UTC) y se
+  audita `budget_exceeded`. La página muestra el mismo mensaje que con el límite de peticiones.
+
+El campo `cache` de toda respuesta `200` vale `none`, `gateway` (alguna llamada vino de la caché
+del gateway) o `response`. La caché y el presupuesto son del proceso, como el límite de
+peticiones: con varios procesos cada uno tiene los suyos y el tope efectivo se multiplica.
+
+Cuánto ahorra cada palanca, qué arriesga, cómo se mide y la proyección mensual están en
+`doc/cost-analysis.md`.
+
 Los precios cambian: revisa `data/model_prices.json` contra la página de precios de Workers AI
 antes de usarlo. Si `MODEL_SMALL` o `MODEL_LARGE` no tienen precio, el producto no arranca.
 
@@ -311,14 +357,49 @@ Eventos:
   la clave no sirve); siempre el último de cada petición.
 - `agent_run`: `client`, `question_chars`, `history_messages`, `steps`, `tools`, `input_tokens`,
   `output_tokens`, `stopped`, `model`, `route`, `history_sent` (mensajes del historial que sí
-  se mandaron), `cached_calls`, `cost_usd`, `agents`, `fallback` y `review`. Nunca el texto de
-  la pregunta ni de la respuesta.
+  se mandaron), `cached_calls`, `cost_usd`, `agents`, `fallback`, `review` y `cache` (`none`,
+  `gateway` o `response`). Nunca el texto de la pregunta ni de la respuesta.
+- `agent_step`: uno por agente de cada `POST /ask`, antes de `agent_run`, con `client`, `agent`,
+  `latency_ms` y `outcome` (`ok`, `blocked`, `forbidden`, `skipped` o `error`). Tras un bloqueo
+  los agentes que ya no corren quedan `skipped`; con respaldo, el especialista deja dos pasos
+  (`error` y luego `ok`).
+- `alert`: cuando una alerta se enciende o se apaga, con `alert` y `state` (`on` u `off`). Sale
+  solo en el cambio, no en cada petición.
 - `audit`: cada acción relevante, con `client`, `request_id`, `action` y `outcome`. Por ejemplo
   `tool_call` (una por herramienta que pide el agente, con `tool` y `args` tapados y
   recortados), `tool_denied`, `auth_failed`, `rate_limited`, `forbidden`, `pii_detected`,
-  `injection_blocked`, `output_reviewed` y `fallback` (ver «Seguridad en capas»). Nunca lleva el
+  `injection_blocked`, `output_reviewed`, `fallback` y `budget_exceeded` (ver «Seguridad en
+  capas»). Nunca lleva el
   texto de la pregunta, de la respuesta ni una clave.
 - `error`: el tipo de error en `error_type`, nunca su mensaje.
 
 Para saber qué pasó con una petición, busca su `request_id` en el log (y, con trazas
 encendidas, en los metadatos de LangSmith).
+
+## Observabilidad
+
+- **Trazas.** Con `LANGSMITH_TRACING=true` y `LANGSMITH_API_KEY`, cada `POST /ask` es una
+  traza del proyecto `LANGSMITH_PROJECT`: un nodo raíz `ask` con `request_id`, `client`,
+  `environment`, `model`, `route`, `agents`, `cost_usd`, `cache` y `fallback`, un hijo por
+  agente (`agent` y `outcome`) y, dentro de cada especialista, un nodo `llm` por llamada al
+  modelo y un nodo `tool` por herramienta. Las etiquetas son el ambiente y los agentes.
+  `HIDE_INPUTS` y `HIDE_OUTPUTS` siguen igual y los metadatos nunca llevan texto ni claves.
+- **Métricas.** `GET /metrics` suma `by_agent` (`runs`, `errors`, `p95_ms`), `by_client`
+  (`requests`, `cost_usd`), `by_model` (`calls`, `cost_usd`), `by_route`, `guardrails`
+  (`pii_input`, `pii_output`, `injection_blocked`, `forbidden`, `output_replaced`), `cache`
+  (`response_hits`, `gateway_hits`, `hit_rate`), `fallbacks`, `cost_usd_per_request` (costo
+  promedio de las respuestas `200`) y `alerts`. `GET /metrics/prometheus` trae
+  `hr_requests_total`, `hr_request_latency_ms` (histograma), `hr_agent_runs_total`,
+  `hr_tokens_total`, `hr_cost_usd_total`, `hr_guardrail_events_total` y `hr_cache_hits_total`,
+  todas con la etiqueta `pid` y nunca con `client` ni `request_id`. Ninguna de las dos rutas se
+  cuenta como petición.
+- **Alertas.** `p95_above_slo` (p95 > `SLO_P95_MS`), `error_rate_high` (> `ALERT_ERROR_RATE`),
+  `cost_per_request_high` (> `ALERT_COST_PER_REQUEST_USD`) y `guardrail_spike` (más de
+  `ALERT_GUARDRAIL_EVENTS` bloqueos en las últimas 1000 peticiones).
+- **Tablero.** `/dashboard` muestra tarjetas (peticiones, tasa de error, p50 y p95 contra el
+  SLO, costo total y por respuesta, tasa de caché y bloqueos), tablas por agente, cliente y
+  modelo, las alertas encendidas y el `pid` del proceso que respondió.
+
+Todo es del proceso, como el límite de peticiones: con varios procesos, cada uno tiene sus
+métricas y sus alertas. Cómo seguir un `request_id`, el runbook de las alertas y el tablero de
+LangSmith están en `doc/observability.md`.

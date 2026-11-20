@@ -17,6 +17,7 @@ CLIENT_SEPARATOR = ":"
 PUBLIC_PATHS = frozenset(
     {
         "/",
+        "/dashboard",
         "/health",
         "/ready",
         "/static/app.js",
