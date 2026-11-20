@@ -36,6 +36,10 @@ jobs:
   security:
     needs: style
     runs-on: ubuntu-latest
+    # gitleaks lista los commits del PR por la API en pull_request; solo lectura
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v5
         with:
