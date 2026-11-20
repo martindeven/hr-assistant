@@ -89,14 +89,33 @@ Lecturas:
 Las estimaciones de A suponen el mismo costo por pregunta de la tabla; hay que confirmarlas repitiendo
 `verification evaluate --provider gateway` después del cambio.
 
+### Corrección aplicada: grounding de políticas (commit `de83091`)
+
+La revisión pregunta por pregunta encontró un error que no dependía del modelo. Con `ROUTING=false`, el 70B también
+respondía «15 días» de vacaciones con `tools_used: []`: el especialista `policies` podía contestar sin consultar la
+política, y el reviewer no lo detectaba. Se corrigió con los ajustes B y C, en versión con modelo:
+
+- `policies` ejecuta siempre `search_policy` antes de llamar al modelo.
+- El reviewer exige que cada número de la respuesta esté en la política; si no, cita el texto de la política
+  (`review: replaced`).
+- El reviewer reemplaza los mensajes internos del agente por la ayuda.
+
+| Corrida con el modelo real (10 preguntas, Render) | Ruta | Calidad |
+| --- | --- | --- |
+| Palancas + caché, antes de la corrección | 8B en todas | 50% |
+| `ROUTING=false`, después de la corrección | 70B en todas | 90% |
+
+La única falla que queda es el clima (ajuste D, la prueba es estricta). La calidad supera a la línea base de
+`evaluate` (80 %).
+
 ### Recomendación para producción
 
-- **Mientras no se apliquen A a C:** `ROUTING=false` (siempre el 70B), con la ventana, el tope de salida, la caché
+- **Configuración actual en Render:** `ROUTING=false` (siempre el 70B), con la ventana, el tope de salida, la caché
   de respuestas y el presupuesto por cliente encendidos. En RH una respuesta equivocada sobre una política cuesta
   más que la diferencia de precio. Con una tasa de aciertos de caché del 50 %, el costo queda en unos USD 0.00015
-  por pregunta, la mitad de la línea base, con su calidad.
-- **Después de A a C:** volver a `ROUTING=true` solo si `evaluate` con el modelo real muestra que no se pierde
-  calidad.
+  por pregunta (unos USD 4.50 al mes con 1000 preguntas al día), la mitad de la línea base, con 90 % de calidad.
+- **Siguiente paso:** el ajuste A (enrutar por tarea). Volver a `ROUTING=true` solo si `evaluate` con el modelo real
+  muestra que no se pierde calidad.
 
 ## Palancas
 

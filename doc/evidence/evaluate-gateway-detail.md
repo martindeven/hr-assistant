@@ -23,3 +23,37 @@ Todas las preguntas son cortas, así que el enrutador mandó las 10 al modelo pe
 | 10 | ¿Cuántos días de home office puedo tomar por semana? | OK | De acuerdo a nuestra política de Recursos Humanos, se permite un máximo de 2 días de home office por semana, siempre y cuando se cumplan con los objetivos y met | — |
 
 **Calidad: 5 de 10 (50 %)**, igual que la fila «Palancas + caché» de `evaluate-gateway.md`.
+
+## Después de la corrección de grounding y con `ROUTING=false`
+
+El 2026-11-20 se publicó la corrección del commit `de83091`:
+
+- El especialista `policies` consulta siempre `search_policy` antes de llamar al modelo.
+- El `reviewer` verifica que cada número de la respuesta esté en la política consultada.
+- El `reviewer` reemplaza los mensajes internos del agente.
+
+Además, `ROUTING=false` en Render: todas las preguntas van al modelo grande
+(`@cf/meta/llama-3.3-70b-instruct-fp8-fast`, ruta `routing_disabled`).
+
+| # | Pregunta | Resultado | Respuesta (primeros 160 caracteres) |
+| --- | --- | --- | --- |
+| 1 | ¿Quién es EMP-0004? | OK | Jorge Díaz, Líder técnico del departamento de Tecnología |
+| 2 | ¿Qué puesto tiene EMP-0005? | OK | El puesto de Sofía Gómez es Contadora |
+| 3 | ¿Quiénes trabajan en el departamento de Finanzas? | OK | Sofía Gómez, con el rol de Contadora, es la empleada del departamento de Finanzas. |
+| 4 | Lista el departamento de Tecnología | OK | El departamento de Tecnología está compuesto por Ana López como Analista de datos, Marta Ruiz como Desarrolladora (actualmente en baja) y Jorge Díaz como Líder |
+| 5 | ¿Sigue activa Marta Ruiz? Su número es EMP-0003 | OK | No, Marta Ruiz no sigue activa, su estatus es baja. |
+| 6 | ¿En qué año ingresó EMP-0002? | OK | El empleado EMP-0002 ingresó en el año 2021 |
+| 7 | ¿Quién es EMP-0099? | OK | No existe un empleado con id EMP-0099. |
+| 8 | ¿Qué clima hace hoy en Monterrey? | MAL | Lo siento, no tengo acceso a información sobre el clima actual en Monterrey. |
+| 9 | ¿Cuántos días de vacaciones me tocan el primer año? | OK | Te corresponden 12 días hábiles de vacaciones el primer año de servicio. |
+| 10 | ¿Cuántos días de home office puedo tomar por semana? | OK | Puedes tomar hasta 2 días de home office por semana, siempre y cuando tengas la aprobación de tu jefe directo. |
+
+**Calidad: 9 de 10 (90 %).** La única falla es el clima, que se rechaza bien pero sin redirigir a RH (ajuste D).
+
+En la página, la pregunta de vacaciones ahora muestra «Herramientas usadas: search_policy» y la cifra correcta,
+12 días (`request_id` `86ff6028-eb91-4dd4-a471-ceea74c9d543`):
+
+![Vacaciones con grounding](policy-grounding-fix.png)
+
+Antes de la corrección, la misma pregunta respondía «15 días» con «Herramientas usadas: ninguna», incluso con el
+modelo grande: el modelo contestaba de memoria y el reviewer no lo detectaba.
