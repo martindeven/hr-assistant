@@ -35,7 +35,7 @@ Feature: End to end observability of every agent
     Then the metrics keep the fields of the earlier sessions
     And the metrics have agent runs for "guard, supervisor, directory, policies, reviewer"
     And the metrics count 2 requests for the test client
-    And the metrics count 4 calls to the small model and 2 "simple" routes
+    And the metrics count 3 calls to the small model and 2 "simple" routes
     And the metrics show no cache hits, no fallbacks and no alerts
     And the cost per request is greater than zero
 

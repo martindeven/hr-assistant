@@ -5,6 +5,7 @@ propio estado, así que se puede usar desde varios hilos a la vez.
 """
 
 import contextlib
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -13,7 +14,13 @@ from app.agent import Agent, AgentResult
 from app.audit import audit_args
 from app.budget import BudgetExceeded
 from app.guard import GUARD_AGENT
-from app.llm import HELP_ANSWER, SYSTEM_PROMPTS, ModelUnavailableError
+from app.llm import (
+    HELP_ANSWER,
+    POLICIES_SPECIALIST,
+    SYSTEM_PROMPTS,
+    TOOL_RESULT_PREFIX,
+    ModelUnavailableError,
+)
 from app.response_cache import CachedAnswer, cache_key
 from app.reviewer import REVIEW_REPLACED, REVIEWER_AGENT, review
 from app.router import choose_route
@@ -26,6 +33,8 @@ FIXED_TEXTS = (HELP_ANSWER,)
 CACHE_NONE = "none"
 CACHE_GATEWAY = "gateway"
 CACHE_RESPONSE = "response"
+POLICY_TOOL = "search_policy"
+POLICY_TOPIC_ARGUMENT = "topic"
 
 
 class Forbidden(Exception):
@@ -259,6 +268,67 @@ class _Hooks:
         self.audit("tool_denied", "denied", tool=tool, args=audit_args(args))
 
 
+@dataclass(frozen=True)
+class _PolicyConsult:
+    """Consulta de la política que hace el pipeline antes de llamar al modelo.
+
+    :param topic: Tema que se consultó
+    :type topic: str
+    :param encoded: Resultado de ``search_policy`` como JSON
+    :type encoded: str
+    :param text: Texto de la política, o ``None`` si no se encontró
+    :type text: str or None
+    """
+
+    topic: str
+    encoded: str
+    text: object = None
+
+    def messages(self, messages):
+        """Agrega la consulta a la conversación, como si el modelo la pidiera.
+
+        :param messages: Historial recortado y pregunta
+        :type messages: list[dict]
+        :return: La conversación que termina con el resultado de la herramienta
+        :rtype: list[dict]
+        """
+        request = {"tool": POLICY_TOOL, "args": {POLICY_TOPIC_ARGUMENT: self.topic}}
+        return [
+            *messages,
+            {"role": "assistant", "content": json.dumps(request, ensure_ascii=False)},
+            {"role": "user", "content": TOOL_RESULT_PREFIX + self.encoded},
+        ]
+
+    def merge(self, result):
+        """Suma la consulta al resultado de ``policies``, sin repetirla.
+
+        :param result: Resultado del agente ``policies``
+        :type result: app.agent.AgentResult
+        :return: El resultado con ``search_policy`` una sola vez al inicio
+        :rtype: app.agent.AgentResult
+        """
+        others = [tool for tool in result.tools_used if tool != POLICY_TOOL]
+        return replace(
+            result,
+            tools_used=[POLICY_TOOL, *others],
+            tool_results=[self.encoded, *result.tool_results],
+        )
+
+
+@dataclass(frozen=True)
+class _Grounding:
+    """Lo que el reviewer necesita para revisar la parte de ``policies``.
+
+    :param answer: Lo que respondió ``policies``, o ``None`` si no corrió
+    :type answer: str or None
+    :param text: Texto de la política consultada, o ``None``
+    :type text: str or None
+    """
+
+    answer: object = None
+    text: object = None
+
+
 class Pipeline:
     """Responde una pregunta con todos los agentes, en orden.
 
@@ -344,13 +414,13 @@ class Pipeline:
         checked, route, chosen = planned
         audit, steps = hooks.audit, hooks.steps
         try:
-            result, model, fallback = self._run_with_fallback(
+            (result, grounding), model, fallback = self._run_with_fallback(
                 chosen, messages, route, hooks
             )
         except Exception:
             steps.skip(REVIEWER_AGENT)
             raise
-        reviewed = self._review(checked.question, result, audit, steps)
+        reviewed = self._review(checked.question, (result, grounding), audit, steps)
         return PipelineResult(
             result=replace(result, answer=reviewed.answer),
             route=route,
@@ -465,13 +535,14 @@ class Pipeline:
         messages.append({"role": "user", "content": checked.question})
         return messages
 
-    def _review(self, question, result, audit, steps):
+    def _review(self, question, answered, audit, steps):
         """Corre el reviewer sobre la respuesta sumada de los especialistas.
 
         :param question: Pregunta revisada por el guard
         :type question: str
-        :param result: Resultado sumado de los especialistas
-        :type result: app.agent.AgentResult
+        :param answered: Resultado sumado de los especialistas y lo que el
+            reviewer necesita para revisar la parte de ``policies``
+        :type answered: tuple[app.agent.AgentResult, _Grounding]
         :param audit: Función ``(action, outcome, **campos)`` de la petición
         :type audit: collections.abc.Callable
         :param steps: Pasos medidos de la petición
@@ -479,6 +550,7 @@ class Pipeline:
         :return: La respuesta revisada
         :rtype: app.reviewer.ReviewResult
         """
+        result, grounding = answered
         with steps.step(REVIEWER_AGENT):
             return review(
                 result.answer,
@@ -487,6 +559,8 @@ class Pipeline:
                 FIXED_TEXTS,
                 max_chars=self._deps.settings.max_answer_chars,
                 audit=audit,
+                policy_answer=grounding.answer,
+                policy_text=grounding.text,
             )
 
     def _supervise(self, question, permissions, audit, steps):
@@ -533,8 +607,9 @@ class Pipeline:
         :type route: app.router.Route
         :param hooks: Auditoría de la petición
         :type hooks: _Hooks
-        :return: El resultado sumado, el modelo que respondió y si hubo respaldo
-        :rtype: tuple[app.agent.AgentResult, str, bool]
+        :return: El resultado sumado con lo que necesita el reviewer, el modelo
+            que respondió y si hubo respaldo
+        :rtype: tuple[tuple[app.agent.AgentResult, _Grounding], str, bool]
         :raises app.llm.ModelUnavailableError: Si ningún modelo responde
         """
         settings = self._deps.settings
@@ -568,32 +643,106 @@ class Pipeline:
         :type model_name: str
         :param hooks: Auditoría de la petición
         :type hooks: _Hooks
-        :return: El resultado sumado
-        :rtype: app.agent.AgentResult
+        :return: El resultado sumado y lo que el reviewer necesita para revisar
+            la parte de ``policies``
+        :rtype: tuple[app.agent.AgentResult, _Grounding]
         """
-        deps = self._deps
-        model = deps.models[model_name]
         steps = hooks.steps or _NullSteps()
         results = []
+        grounding = _Grounding()
         for index, name in enumerate(chosen):
-            agent = Agent(
-                model=model,
-                directory=None,
-                max_steps=deps.settings.agent_max_steps,
-                tracer=deps.tracer,
-                specialist=deps.specialists[name],
-                trace_loop=False,
-            )
             try:
                 with steps.step(name):
-                    results.append(
-                        agent.run(
-                            messages,
-                            on_tool_call=hooks.tool_call,
-                            on_tool_denied=hooks.tool_denied,
+                    if name == POLICIES_SPECIALIST:
+                        result, grounding = self._run_policies(
+                            messages, model_name, hooks
                         )
-                    )
+                    else:
+                        result = self._run_agent(name, messages, model_name, hooks)
+                    results.append(result)
             except Exception:
                 _skip_all(steps, chosen[index + 1 :])
                 raise
-        return combine(results)
+        return combine(results), grounding
+
+    def _run_agent(self, name, messages, model_name, hooks):
+        """Corre el bucle de un especialista.
+
+        :param name: Nombre del especialista
+        :type name: str
+        :param messages: Conversación que recibe el modelo
+        :type messages: list[dict]
+        :param model_name: Modelo de toda la pregunta
+        :type model_name: str
+        :param hooks: Auditoría de la petición
+        :type hooks: _Hooks
+        :return: El resultado del especialista
+        :rtype: app.agent.AgentResult
+        """
+        deps = self._deps
+        agent = Agent(
+            model=deps.models[model_name],
+            directory=None,
+            max_steps=deps.settings.agent_max_steps,
+            tracer=deps.tracer,
+            specialist=deps.specialists[name],
+            trace_loop=False,
+        )
+        return agent.run(
+            messages, on_tool_call=hooks.tool_call, on_tool_denied=hooks.tool_denied
+        )
+
+    def _run_policies(self, messages, model_name, hooks):
+        """Corre ``policies`` con la política ya consultada.
+
+        El modelo real llegaba a responder sin pedir ``search_policy`` e
+        inventaba números; por eso el pipeline consulta la política antes y el
+        modelo solo redacta con el resultado.
+
+        :param messages: Historial recortado y pregunta (la última)
+        :type messages: list[dict]
+        :param model_name: Modelo de toda la pregunta
+        :type model_name: str
+        :param hooks: Auditoría de la petición
+        :type hooks: _Hooks
+        :return: El resultado de ``policies`` y lo que necesita el reviewer
+        :rtype: tuple[app.agent.AgentResult, _Grounding]
+        """
+        consult = self._consult_policy(messages[-1]["content"], hooks)
+        if consult is None:
+            result = self._run_agent(POLICIES_SPECIALIST, messages, model_name, hooks)
+            return result, _Grounding(answer=result.answer)
+        result = self._run_agent(
+            POLICIES_SPECIALIST, consult.messages(messages), model_name, hooks
+        )
+        grounding = _Grounding(answer=result.answer, text=consult.text)
+        return consult.merge(result), grounding
+
+    def _consult_policy(self, question, hooks):
+        """Ejecuta ``search_policy`` con el tema que menciona la pregunta.
+
+        Se audita como cualquier herramienta (``tool_call``) y se traza si hay
+        ``Tracer``.
+
+        :param question: Pregunta revisada por el guard
+        :type question: str
+        :param hooks: Auditoría de la petición
+        :type hooks: _Hooks
+        :return: La consulta, o ``None`` si la pregunta no menciona un tema
+        :rtype: _PolicyConsult or None
+        """
+        deps = self._deps
+        topic = deps.policy_book.find_keyword(question)
+        if topic is None:
+            return None
+        hooks.tool_call(POLICY_TOOL, {POLICY_TOPIC_ARGUMENT: topic})
+        search = deps.specialists[POLICIES_SPECIALIST].tools[POLICY_TOOL].function
+        if deps.tracer is not None:
+            search = deps.tracer.wrap(search, name=POLICY_TOOL, run_type="tool")
+        found = search(topic)
+        text = found.get("text") if isinstance(found, dict) else None
+        return _PolicyConsult(
+            topic=topic,
+            encoded=json.dumps(found, ensure_ascii=False),
+            text=text if isinstance(text, str) else None,
+        )

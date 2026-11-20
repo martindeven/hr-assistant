@@ -38,12 +38,65 @@ variables `CF_*` ya puestas en el entorno:
 
     uv run python -m verification evaluate --provider gateway
 
-Pega aquí la tabla que imprime (también queda en `output/evaluate.md`), con la fecha de la corrida:
-
-> Pendiente: tabla de `verification evaluate --provider gateway` (fecha: ____).
-
 Con el modelo real la calidad puede variar entre corridas aunque `MODEL_TEMPERATURE=0`; si una configuración
 pierde calidad, esa palanca no se usa.
+
+### Corrida del 2026-11-20 (Workers AI vía AI Gateway)
+
+Evidencia: `doc/evidence/evaluate-gateway.md` (tabla) y `doc/evidence/evaluate-gateway-detail.md` (pregunta por
+pregunta).
+
+| Configuración | Calidad | Costo (USD, 20 preguntas) | Tokens de entrada | Ahorro | Costo por pregunta | Costo por respuesta correcta |
+| --- | --- | --- | --- | --- | --- | --- |
+| Línea base (70B, sin ventana, sin caché) | 80% | 0.006010 | 12944 | 0% | 0.0003005 | 0.000376 |
+| Palancas (enrutamiento + ventana) | 60% | 0.001216 | 15921 | 80% | 0.0000608 | 0.000101 |
+| Palancas + caché de respuestas | 50% | 0.000759 | 10310 | 87% | 0.0000380 | 0.000076 |
+
+**Veredicto.** Con el modelo real, la regla de `evaluate` **no se cumple**: las palancas ahorran 80 % y 87 %, pero
+pierden 20 y 30 puntos de calidad. La versión simulada (100 % en las tres) no lo podía mostrar, porque sus dos
+modelos responden igual.
+
+**Qué falla y por qué** (detalle en la evidencia):
+
+| Falla | Preguntas | Causa | Palanca responsable |
+| --- | --- | --- | --- |
+| Listas sin terminar («No pude completar la respuesta») | Finanzas, Tecnología | El 8B no cierra el ciclo de herramientas y llega al tope de pasos | Enrutamiento |
+| Política inventada (15 días en lugar de 12) | Vacaciones | El 8B no se apega al resultado de `search_policy`; el reviewer solo verifica ids `EMP-####`, no cifras | Enrutamiento |
+| Formato inválido | EMP-0005 | El 8B responde un JSON sin `answer` ni `tool` y luego repite el mensaje de error | Enrutamiento |
+| No redirige a RH | Clima | Rechaza bien, pero sin mencionar RH; la línea base también la falla a veces | Criterio de evaluación estricto |
+
+Lecturas:
+
+- **El enrutamiento es la palanca que cuesta calidad.** Todas las preguntas del conjunto son cortas, así que la
+  regla de `ROUTER_MAX_CHARS` manda las 10 al 8B. La regla mide el largo, pero lo que hace difícil una pregunta es
+  la tarea (listar, citar una política).
+- **Las palancas usan más tokens y cuestan menos.** El 8B da más vueltas con las herramientas (15 921 contra
+  12 944 tokens), pero cuesta unas 6 veces menos por token.
+- **La caché no empeora respuestas, las repite.** En la segunda ronda devuelve lo que contestó la primera; si
+  estaba mal, cuenta mal dos veces. La diferencia de 10 puntos con «Palancas» es una sola pregunta, dentro de la
+  variación del modelo.
+- **La línea base tampoco llega al 100 %:** el 70B falla 2 de 10, sobre todo por la forma de la respuesta.
+
+### Ajustes propuestos (por medir)
+
+| Ajuste | Qué resuelve | Costo estimado por pregunta | Ahorro estimado frente a la línea base |
+| --- | --- | --- | --- |
+| A. Enrutar por tarea: listas de departamento y preguntas de `policies` van al 70B (4 de cada 10) | Listas y política inventada | 0.6 x 0.0000608 + 0.4 x 0.0003005 = 0.000157 | 48% |
+| B. `policies` responde con el texto de la política (extractivo, sin modelo) | Política inventada, con costo 0 en ese agente | Menor que A | Mayor que A |
+| C. Un reintento cuando el modelo devuelve un JSON inválido, y que el reviewer reemplace mensajes internos | EMP-0005 | Una llamada extra solo cuando falla | Casi igual |
+| D. Prompt de `directory`: fuera de tema, redirigir a RH | Clima | 0 | Igual |
+
+Las estimaciones de A suponen el mismo costo por pregunta de la tabla; hay que confirmarlas repitiendo
+`verification evaluate --provider gateway` después del cambio.
+
+### Recomendación para producción
+
+- **Mientras no se apliquen A a C:** `ROUTING=false` (siempre el 70B), con la ventana, el tope de salida, la caché
+  de respuestas y el presupuesto por cliente encendidos. En RH una respuesta equivocada sobre una política cuesta
+  más que la diferencia de precio. Con una tasa de aciertos de caché del 50 %, el costo queda en unos USD 0.00015
+  por pregunta, la mitad de la línea base, con su calidad.
+- **Después de A a C:** volver a `ROUTING=true` solo si `evaluate` con el modelo real muestra que no se pierde
+  calidad.
 
 ## Palancas
 
@@ -137,6 +190,16 @@ configuración) y, para la caché, la misma tasa de aciertos que en la evaluaci�
 | Con palancas (enrutamiento y ventana) | 0.0000169 | 0.51 |
 | Con palancas y caché de respuestas (50 % de aciertos) | 0.0000085 | 0.25 |
 
-Son órdenes de magnitud, no un presupuesto: los tokens del modelo simulado no son los del modelo real y la tasa de
+Con el modelo real (corrida del 2026-11-20, 20 preguntas por configuración):
+
+| Configuración | Calidad | Costo por pregunta (USD) | Costo mensual (USD) |
+| --- | --- | --- | --- |
+| Línea base (70B siempre) | 80% | 0.0003005 | 9.02 |
+| Palancas (enrutamiento y ventana) | 60% | 0.0000608 | 1.82 |
+| Palancas y caché de respuestas | 50% | 0.0000380 | 1.14 |
+| Recomendada: 70B, ventana y caché (50 % de aciertos, estimado) | ~80% | ~0.00015 | ~4.50 |
+| Ajuste A con caché (estimado) | ~80% | ~0.000079 | ~2.40 |
+
+Para el modelo simulado son órdenes de magnitud, no un presupuesto: los tokens del modelo simulado no son los del modelo real y la tasa de
 aciertos real depende de cuánto se repitan las preguntas y de cuántos procesos haya. Para presupuestar, rehaz la
 cuenta con la tabla del modelo real y con `cache.hit_rate` y `cost_usd_per_request` de `/metrics` en producción.

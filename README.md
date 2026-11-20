@@ -89,7 +89,7 @@ Cada `POST /ask` corre estos agentes, en orden, y la respuesta los lista en `age
 | `guard` | Revisa la pregunta y el historial (datos personales e inyección) | No |
 | `supervisor` | Elige los especialistas (sin distinguir mayúsculas ni acentos) | No |
 | `directory` | Herramientas `get_employee` y `search_by_department` | Sí |
-| `policies` | Herramienta `search_policy(topic)` sobre `POLICIES_PATH` | Sí |
+| `policies` | Herramienta `search_policy(topic)` sobre `POLICIES_PATH`; el pipeline la consulta antes de llamar al modelo | Sí |
 | `reviewer` | Revisa la respuesta final | No |
 
 Reglas del supervisor: un id `EMP-####` o un departamento que existe (palabra completa) va a
@@ -97,6 +97,13 @@ Reglas del supervisor: un id `EMP-####` o un departamento que existe (palabra co
 a `policies` (las respuestas se juntan con un salto de línea y `steps` y `tools_used` se suman);
 ninguna, a `directory`, que contesta con la ayuda. El enrutador elige el modelo una sola vez y
 lo usan todos los especialistas de la pregunta.
+
+`policies` no deja que el modelo decida si consulta la política: antes de llamarlo, el pipeline
+ejecuta `search_policy` con el tema que menciona la pregunta, lo audita como `tool_call` y le
+manda al modelo el resultado como si lo hubiera pedido. El modelo solo redacta (con el modelo
+simulado, en un paso) y `tools_used` trae `search_policy` una sola vez. Así se corrigió en
+producción la respuesta «15 días» a «¿Cuántos días de vacaciones me tocan el primer año?»
+(la política dice 12): el modelo real contestaba sin consultar la política.
 
 Cada especialista solo ejecuta sus herramientas: si el modelo pide una ajena o que no existe,
 no se ejecuta, el modelo recibe un error y se audita `tool_denied`. `guardrails` trae
@@ -176,9 +183,16 @@ herramientas, y al final el `reviewer`. El modelo de amenazas
   "request_id": ...}` y el modelo no se llama. Los argumentos de las herramientas se validan:
   `employee_id` con `^EMP-\d{4}$`, `department` y `topic` de 60 caracteres como máximo.
 - **Revisión de la salida.** El `reviewer` cambia una respuesta vacía por la ayuda, una que
-  filtra el inicio de un prompt de sistema por un mensaje seguro y una que menciona un
-  `EMP-####` sin evidencia (ni en la pregunta ni en una herramienta) por «No pude verificar la
-  respuesta con el directorio.»; tapa los datos personales y recorta a `MAX_ANSWER_CHARS`.
+  filtra el inicio de un prompt de sistema por un mensaje seguro, una que trae un mensaje
+  interno del agente (errores del protocolo o «Resultado de la herramienta:») por la ayuda
+  (regla `internal_message`) y una que menciona un `EMP-####` sin evidencia (ni en la pregunta
+  ni en una herramienta) por «No pude verificar la respuesta con el directorio.». Además revisa
+  la parte que escribió `policies`: cada número debe aparecer en la política consultada seguido
+  de la misma palabra (sin mayúsculas ni acentos) y su cláusula debe compartir al menos una
+  palabra con contenido con una cláusula de la política que trae ese número y esa unidad. Si
+  falla uno, o no hubo consulta, solo esa parte se cambia por «Según la política: <texto>»
+  (regla `policy_ungrounded`); «Te tocan 15 días.» se reemplaza porque el 15 de la política es
+  de anticipación. Al final tapa los datos personales y recorta a `MAX_ANSWER_CHARS`.
 - **Permisos por cliente.** `API_KEY_SCOPES` tiene la forma `cliente:permiso permiso,...` con
   los permisos `directory`, `policies` y `metrics`. El supervisor solo corre los especialistas
   permitidos; si no queda ninguno, `403 {"detail": "forbidden for this client", "request_id":

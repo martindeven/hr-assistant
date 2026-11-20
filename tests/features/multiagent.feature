@@ -27,7 +27,7 @@ Feature: Supervisor, specialists and resilience
     And the tools used are "get_employee, search_policy"
     And the answer contains "Jorge Díaz"
     And the answer contains "12"
-    And the steps add up to 4
+    And the steps add up to 3
 
   Scenario: A question without a topic gets the usual help
     Given the HR assistant is running with the fake model

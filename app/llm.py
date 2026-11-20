@@ -14,6 +14,21 @@ from app.policies import PolicyBook
 
 TOOL_RESULT_PREFIX = "Resultado de la herramienta: "
 HELP_ANSWER = "Pregúntame por un empleado (EMP-0001) o un departamento."
+# Mensajes internos del agente: van al modelo como resultado de herramienta y
+# nunca deben llegar a una persona (el reviewer los busca con estos textos).
+INVALID_JSON_MESSAGE = "La respuesta del modelo no es JSON válido."
+MISSING_REPLY_KEYS_MESSAGE = "La respuesta debe tener 'answer' o 'tool'."
+TOOL_DENIED_TEMPLATE = (
+    "La herramienta {tool!r} no está permitida para este especialista."
+)
+MISSING_ARGUMENT_TEMPLATE = "La herramienta {name} necesita el argumento '{argument}'."
+INTERNAL_MESSAGE_TEMPLATES = (
+    INVALID_JSON_MESSAGE,
+    MISSING_REPLY_KEYS_MESSAGE,
+    TOOL_DENIED_TEMPLATE,
+    MISSING_ARGUMENT_TEMPLATE,
+    TOOL_RESULT_PREFIX,
+)
 EMPLOYEE_ID_PATTERN = re.compile(r"EMP-\d{4}")
 FAKE_MODEL_NAME = "fake"
 GATEWAY_URL_TEMPLATE = (

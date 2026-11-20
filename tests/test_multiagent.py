@@ -119,7 +119,8 @@ def test_a_tool_of_another_specialist_or_an_unknown_tool_is_denied(
     ).json()
 
     assert body["agents"] == ["guard", "supervisor", "policies", "reviewer"]
-    assert body["tools_used"] == []
+    # La política se consulta siempre antes del modelo (corrección en producción).
+    assert body["tools_used"] == ["search_policy"]
     denied = audits(observed, "tool_denied")
     assert [event["tool"] for event in denied] == ["get_employee", "delete_everything"]
     assert "error" in model.calls[1][-1]["content"]

@@ -3,7 +3,15 @@
 import json
 from dataclasses import dataclass, field, replace
 
-from app.llm import DIRECTORY_SPECIALIST, SYSTEM_ROLE, TOOL_RESULT_PREFIX
+from app.llm import (
+    DIRECTORY_SPECIALIST,
+    INVALID_JSON_MESSAGE,
+    MISSING_ARGUMENT_TEMPLATE,
+    MISSING_REPLY_KEYS_MESSAGE,
+    SYSTEM_ROLE,
+    TOOL_DENIED_TEMPLATE,
+    TOOL_RESULT_PREFIX,
+)
 from app.specialists import ARGUMENT_VALIDATORS, Tool
 
 STEP_CAP_ANSWER = (
@@ -103,9 +111,7 @@ class ToolDenied(ProtocolError):
     """
 
     def __init__(self, tool):
-        super().__init__(
-            f"La herramienta {tool!r} no está permitida para este especialista."
-        )
+        super().__init__(TOOL_DENIED_TEMPLATE.format(tool=tool))
         self.tool = tool
 
 
@@ -324,12 +330,11 @@ class Agent:
         try:
             reply = json.loads(content)
         except (TypeError, ValueError) as error:
-            message = "La respuesta del modelo no es JSON válido."
-            raise ProtocolError(message) from error
+            raise ProtocolError(INVALID_JSON_MESSAGE) from error
         if not isinstance(reply, dict) or not (
             "answer" in reply or "tool" in reply
         ):
-            raise ProtocolError("La respuesta debe tener 'answer' o 'tool'.")
+            raise ProtocolError(MISSING_REPLY_KEYS_MESSAGE)
         return reply
 
     def _execute(self, reply):
@@ -349,7 +354,7 @@ class Agent:
         args = reply.get("args")
         if not isinstance(args, dict) or not isinstance(args.get(tool.argument), str):
             raise ProtocolError(
-                f"La herramienta {name} necesita el argumento '{tool.argument}'."
+                MISSING_ARGUMENT_TEMPLATE.format(name=name, argument=tool.argument)
             )
         problem = tool.validator(args[tool.argument])
         if problem:
