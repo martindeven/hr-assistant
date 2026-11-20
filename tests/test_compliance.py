@@ -15,6 +15,8 @@ SAFE_PRODUCTION_ENV = {
     "CF_ACCOUNT_ID": "acc123",
     "CF_API_TOKEN": "cf-token-not-real",
     "API_KEYS": f"ops:{PROD_KEY}",
+    # Regla 3.7 de la spec 05: en producción cada cliente necesita alcances.
+    "API_KEY_SCOPES": "ops:directory policies metrics",
 }
 TRACING_ON = {"LANGSMITH_TRACING": "true", "LANGSMITH_API_KEY": "lsv2-not-real"}
 

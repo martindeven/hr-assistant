@@ -2,12 +2,15 @@
 
 import json
 import re
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 import httpx
 
 from app.config import ConfigError
+from app.policies import PolicyBook
 
 TOOL_RESULT_PREFIX = "Resultado de la herramienta: "
 HELP_ANSWER = "Pregúntame por un empleado (EMP-0001) o un departamento."
@@ -32,13 +35,43 @@ SYSTEM_PROMPT = (
     f"El resultado de una herramienta llega en un mensaje que empieza con "
     f"'{TOOL_RESULT_PREFIX}'. Responde solo con datos del directorio."
 )
+POLICIES_SYSTEM_PROMPT = (
+    "Eres el especialista en políticas de Recursos Humanos. Responde siempre con "
+    "un solo objeto JSON, sin texto alrededor. Para responder: "
+    '{"answer": "<respuesta en español>"}. Para consultar una política usa la '
+    'herramienta {"tool": "search_policy", "args": {"topic": "<tema>"}}. '
+    f"El resultado de una herramienta llega en un mensaje que empieza con "
+    f"'{TOOL_RESULT_PREFIX}'. Responde solo con el texto de las políticas."
+)
+DIRECTORY_SPECIALIST = "directory"
+POLICIES_SPECIALIST = "policies"
+SYSTEM_PROMPTS = {
+    DIRECTORY_SPECIALIST: SYSTEM_PROMPT,
+    POLICIES_SPECIALIST: POLICIES_SYSTEM_PROMPT,
+}
+SYSTEM_ROLE = "system"
+POLICY_ANSWER_PREFIX = "Según la política: "
+NO_POLICY_ANSWER = "No encontré una política de RH sobre ese tema."
+RETRIABLE_STATUS = 429
+SERVER_ERROR_MIN = 500
+MILLISECONDS_PER_SECOND = 1000
+DEFAULT_POLICIES_PATH = Path(__file__).resolve().parents[1] / "data" / "policies.json"
 
 
 class ModelUnavailableError(RuntimeError):
     """El modelo no respondió bien: red, tiempo de espera, estado o cuerpo.
 
     El mensaje nunca lleva el cuerpo de la respuesta ni el token.
+
+    :param message: Descripción sin datos sensibles
+    :type message: str
+    :param retriable: ``True`` si la falla es transitoria y vale la pena reintentar
+    :type retriable: bool
     """
+
+    def __init__(self, message, retriable=False):
+        super().__init__(message)
+        self.retriable = retriable
 
 
 @dataclass(frozen=True)
@@ -85,24 +118,69 @@ def _count_words(text):
     return len(str(text).split())
 
 
+def _specialist_of(messages):
+    """Reconoce qué especialista llama al modelo por su mensaje ``system``.
+
+    Sin mensaje ``system`` (como en las sesiones 1 a 4) es ``directory``.
+
+    :param messages: Mensajes con ``role`` y ``content``
+    :type messages: list[dict]
+    :return: El nombre del especialista
+    :rtype: str
+    """
+    for message in messages:
+        if message.get("role") == SYSTEM_ROLE:
+            for name, prompt in SYSTEM_PROMPTS.items():
+                if message.get("content") == prompt:
+                    return name
+    return DIRECTORY_SPECIALIST
+
+
+def _policy_text(result):
+    """Saca el texto de un resultado de ``search_policy`` para citarlo.
+
+    :param result: Resultado de la herramienta, como texto JSON
+    :type result: str
+    :return: El texto de la política, el error o el resultado tal cual
+    :rtype: str
+    """
+    try:
+        data = json.loads(result)
+    except ValueError:
+        return result
+    if isinstance(data, dict):
+        for key in ("text", "error"):
+            if isinstance(data.get(key), str):
+                return data[key]
+    return result
+
+
 class FakeModel:
     """Modelo simulado: decide con reglas fijas sobre el último mensaje.
 
     Responde igual con cualquier nombre: el nombre solo sirve para cobrar con
-    el precio de ese modelo.
+    el precio de ese modelo. Reconoce al especialista que lo llama por el
+    mensaje ``system`` y solo pide herramientas de ese especialista.
 
     :param departments: Departamentos que existen en los datos
     :type departments: list[str]
     :param name: Nombre del modelo (el de ``MODEL_SMALL`` o ``MODEL_LARGE``)
     :type name: str
+    :param policy_book: Políticas para reconocer sus palabras clave; por
+        omisión las de ``data/policies.json``
+    :type policy_book: app.policies.PolicyBook or None
     """
 
-    def __init__(self, departments, name=FAKE_MODEL_NAME):
+    def __init__(self, departments, name=FAKE_MODEL_NAME, policy_book=None):
         self._departments = tuple(departments)
         self.name = name
+        self._policy_book = policy_book or PolicyBook.load(DEFAULT_POLICIES_PATH)
 
     def complete(self, messages):
-        """Aplica las 4 reglas de la especificación al último mensaje.
+        """Aplica las reglas de la especificación al último mensaje.
+
+        Los mensajes ``system`` no cuentan como tokens: el modelo simulado
+        aproxima solo la conversación, como en las sesiones anteriores.
 
         :param messages: Mensajes con ``role`` y ``content``
         :type messages: list[dict]
@@ -110,13 +188,40 @@ class FakeModel:
         :rtype: Completion
         """
         last = str(messages[-1]["content"]) if messages else ""
-        content = json.dumps(self._decide(last), ensure_ascii=False)
-        input_tokens = sum(_count_words(message["content"]) for message in messages)
+        if _specialist_of(messages) == POLICIES_SPECIALIST:
+            decision = self._decide_policy(last)
+        else:
+            decision = self._decide(last)
+        content = json.dumps(decision, ensure_ascii=False)
+        input_tokens = sum(
+            _count_words(message["content"])
+            for message in messages
+            if message.get("role") != SYSTEM_ROLE
+        )
         return Completion(
             content=content,
             input_tokens=input_tokens,
             output_tokens=_count_words(content),
         )
+
+    def _decide_policy(self, last):
+        """Elige la respuesta del especialista ``policies``.
+
+        Con un resultado de herramienta lo cita; con una palabra clave de una
+        política pide ``search_policy``; si no, dice que no hay política.
+
+        :param last: Contenido del último mensaje
+        :type last: str
+        :return: Objeto del protocolo (``answer`` o ``tool``)
+        :rtype: dict
+        """
+        if last.startswith(TOOL_RESULT_PREFIX):
+            result = last[len(TOOL_RESULT_PREFIX):]
+            return {"answer": POLICY_ANSWER_PREFIX + _policy_text(result)}
+        topic = self._policy_book.find_keyword(last)
+        if topic is not None:
+            return {"tool": "search_policy", "args": {"topic": topic}}
+        return {"answer": NO_POLICY_ANSWER}
 
     def _decide(self, last):
         """Elige la respuesta según el último mensaje.
@@ -204,12 +309,16 @@ class GatewayModel:
     :type settings: app.config.Settings
     :param http_client: Cliente HTTP inyectado; por omisión uno nuevo
     :type http_client: httpx.Client or None
+    :param sleep: Función que espera los segundos indicados entre reintentos;
+        por omisión ``time.sleep`` (las pruebas inyectan una falsa)
+    :type sleep: collections.abc.Callable[[float], None] or None
     """
 
-    def __init__(self, name, settings, http_client=None):
+    def __init__(self, name, settings, http_client=None, sleep=None):
         self.name = name
         self._settings = settings
         self._client = http_client or httpx.Client()
+        self._sleep = sleep or time.sleep
         self._url = GATEWAY_URL_TEMPLATE.format(
             account_id=settings.cf_account_id, gateway_id=settings.cf_gateway_id
         )
@@ -225,40 +334,85 @@ class GatewayModel:
             headers[CACHE_TTL_HEADER] = str(self._settings.cache_ttl_seconds)
         return headers
 
+    def _body(self, messages):
+        """Arma el cuerpo de la petición con un solo mensaje ``system``.
+
+        Si la conversación ya trae el ``system`` del especialista, se usa ese;
+        si no, el de ``directory``, como en las sesiones anteriores.
+
+        :param messages: Mensajes con ``role`` y ``content``
+        :type messages: list[dict]
+        :return: El cuerpo JSON de la petición
+        :rtype: dict
+        """
+        sent = [
+            {"role": message["role"], "content": message["content"]}
+            for message in messages
+        ]
+        if not any(message["role"] == SYSTEM_ROLE for message in sent):
+            sent.insert(0, {"role": SYSTEM_ROLE, "content": SYSTEM_PROMPT})
+        return {
+            "model": self.name,
+            "messages": sent,
+            "max_tokens": self._settings.model_max_tokens,
+            "temperature": self._settings.model_temperature,
+        }
+
     def complete(self, messages):
-        """Manda la conversación al gateway y devuelve su respuesta.
+        """Manda la conversación al gateway, con reintentos, y devuelve su respuesta.
+
+        Hace hasta ``1 + MODEL_RETRIES`` intentos. Entre intentos espera
+        ``MODEL_RETRY_BACKOFF_MS`` y duplica la espera cada vez. Solo reintenta
+        fallas transitorias: tiempo de espera, red, ``429`` y ``5xx``.
 
         :param messages: Mensajes con ``role`` y ``content``
         :type messages: list[dict]
         :return: El texto sin cercas, los tokens de ``usage`` y si fue cacheada
         :rtype: Completion
         :raises ModelUnavailableError: Si hay error de red, tiempo de espera,
-            estado que no es 2xx o el cuerpo no trae los campos esperados
+            estado que no es 2xx o el cuerpo no trae los campos esperados, y ya
+            no quedan reintentos (o la falla no se reintenta)
         """
-        body = {
-            "model": self.name,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT}]
-            + [
-                {"role": message["role"], "content": message["content"]}
-                for message in messages
-            ],
-            "max_tokens": self._settings.model_max_tokens,
-            "temperature": self._settings.model_temperature,
-        }
+        body = self._body(messages)
+        retries = self._settings.model_retries
+        wait_seconds = self._settings.model_retry_backoff_ms / MILLISECONDS_PER_SECOND
+        attempt = 0
+        while True:
+            try:
+                return self._attempt(body)
+            except ModelUnavailableError as error:
+                if not error.retriable or attempt >= retries:
+                    raise
+            self._sleep(wait_seconds)
+            wait_seconds *= 2
+            attempt += 1
+
+    def _attempt(self, body):
+        """Hace una sola llamada al gateway.
+
+        :param body: Cuerpo JSON de la petición
+        :type body: dict
+        :return: La respuesta del modelo
+        :rtype: Completion
+        :raises ModelUnavailableError: Si la llamada falla; ``retriable`` dice si
+            la falla es transitoria
+        """
         try:
             response = self._client.post(
                 self._url,
                 json=body,
                 headers=self._headers(),
-                timeout=GATEWAY_TIMEOUT_SECONDS,
+                timeout=self._settings.model_timeout_seconds,
             )
         except httpx.HTTPError as error:
             raise ModelUnavailableError(
-                f"gateway call failed: {type(error).__name__}"
+                f"gateway call failed: {type(error).__name__}", retriable=True
             ) from error
         if not response.is_success:
+            status = response.status_code
             raise ModelUnavailableError(
-                f"gateway returned status {response.status_code}"
+                f"gateway returned status {status}",
+                retriable=status == RETRIABLE_STATUS or status >= SERVER_ERROR_MIN,
             )
         try:
             data = response.json()
@@ -274,7 +428,7 @@ class GatewayModel:
         )
 
 
-def build_models(settings, directory, http_client=None):
+def build_models(settings, directory, http_client=None, policy_book=None):
     """Crea un modelo por nombre: el de ``MODEL_SMALL`` y el de ``MODEL_LARGE``.
 
     :param settings: Configuración de la aplicación
@@ -283,6 +437,9 @@ def build_models(settings, directory, http_client=None):
     :type directory: app.directory.EmployeeDirectory
     :param http_client: Cliente HTTP para ``gateway``; por omisión uno nuevo
     :type http_client: httpx.Client or None
+    :param policy_book: Políticas que reconoce el modelo simulado; por omisión
+        las de ``POLICIES_PATH``
+    :type policy_book: app.policies.PolicyBook or None
     :return: Los modelos por nombre
     :rtype: dict[str, LanguageModel]
     :raises ConfigError: Si el proveedor no es ``fake`` ni ``gateway``
@@ -290,7 +447,11 @@ def build_models(settings, directory, http_client=None):
     names = (settings.model_small, settings.model_large)
     if settings.model_provider == "fake":
         departments = directory.departments()
-        return {name: FakeModel(departments, name=name) for name in names}
+        book = policy_book or PolicyBook.load(settings.policies_path)
+        return {
+            name: FakeModel(departments, name=name, policy_book=book)
+            for name in names
+        }
     if settings.model_provider == "gateway":
         client = http_client or httpx.Client()
         return {

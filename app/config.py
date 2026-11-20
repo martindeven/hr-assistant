@@ -1,5 +1,6 @@
 """Configuración del HR Assistant, leída de un mapeo de variables de entorno."""
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from app.compliance import check_production
 from app.errors import ConfigError
 from app.pricing import PriceError, PriceTable
+from app.scopes import parse_api_key_scopes
 from app.security import parse_api_keys
 
 __all__ = ["ConfigError", "Settings", "load_settings"]
@@ -39,6 +41,16 @@ BOOLEAN_VALUES = {"true": True, "false": False}
 DEFAULT_ENVIRONMENT = "development"
 SUPPORTED_ENVIRONMENTS = ("development", "production")
 DEFAULT_RATE_LIMIT_PER_MINUTE = "30"
+DEFAULT_POLICIES_PATH = "data/policies.json"
+DEFAULT_MODEL_RETRIES = "2"
+DEFAULT_MODEL_RETRY_BACKOFF_MS = "200"
+DEFAULT_MODEL_FALLBACK = "true"
+DEFAULT_MODEL_TIMEOUT_SECONDS = "30"
+DEFAULT_PII_INPUT_MODE = "redact"
+PII_INPUT_MODES = ("redact", "block", "off")
+DEFAULT_INJECTION_GUARD = "true"
+DEFAULT_MAX_ANSWER_CHARS = "1500"
+DEFAULT_MAX_BODY_BYTES = "65536"
 
 
 # Es un registro plano e inmutable de variables de entorno: cada variable es un
@@ -99,6 +111,28 @@ class Settings:  # pylint: disable=too-many-instance-attributes
     :type api_keys: dict[str, str]
     :param rate_limit_per_minute: Peticiones por cliente por minuto
     :type rate_limit_per_minute: int
+    :param policies_path: Ruta absoluta al archivo de políticas de RH
+    :type policies_path: pathlib.Path
+    :param model_retries: Reintentos ante fallas transitorias del modelo
+    :type model_retries: int
+    :param model_retry_backoff_ms: Espera inicial entre reintentos (se duplica)
+    :type model_retry_backoff_ms: int
+    :param model_fallback: Si se responde con ``MODEL_SMALL`` cuando
+        ``MODEL_LARGE`` falla
+    :type model_fallback: bool
+    :param model_timeout_seconds: Tope de espera de cada llamada al modelo
+    :type model_timeout_seconds: float
+    :param pii_input_mode: ``redact``, ``block`` u ``off``
+    :type pii_input_mode: str
+    :param injection_guard: Si se bloquea la inyección de instrucciones
+    :type injection_guard: bool
+    :param max_answer_chars: Largo máximo de la respuesta
+    :type max_answer_chars: int
+    :param max_body_bytes: Tamaño máximo del cuerpo de una petición
+    :type max_body_bytes: int
+    :param api_key_scopes: Permisos de cada cliente; nombra a los clientes, así
+        que no sale en ``repr``
+    :type api_key_scopes: dict[str, frozenset[str]]
     """
 
     model_provider: str
@@ -127,6 +161,119 @@ class Settings:  # pylint: disable=too-many-instance-attributes
     environment: str = DEFAULT_ENVIRONMENT
     api_keys: dict = field(default_factory=dict, repr=False, compare=False)
     rate_limit_per_minute: int = int(DEFAULT_RATE_LIMIT_PER_MINUTE)
+    policies_path: Path = PRODUCT_ROOT / DEFAULT_POLICIES_PATH
+    model_retries: int = int(DEFAULT_MODEL_RETRIES)
+    model_retry_backoff_ms: int = int(DEFAULT_MODEL_RETRY_BACKOFF_MS)
+    model_fallback: bool = True
+    model_timeout_seconds: float = float(DEFAULT_MODEL_TIMEOUT_SECONDS)
+    pii_input_mode: str = DEFAULT_PII_INPUT_MODE
+    injection_guard: bool = True
+    max_answer_chars: int = int(DEFAULT_MAX_ANSWER_CHARS)
+    max_body_bytes: int = int(DEFAULT_MAX_BODY_BYTES)
+    api_key_scopes: dict = field(default_factory=dict, repr=False, compare=False)
+
+
+def _data_path(env, name, default):
+    """Resuelve la ruta de un archivo de datos y comprueba que exista.
+
+    Las rutas relativas se resuelven contra la raíz de ``product/``.
+
+    :param env: Mapeo de variables de entorno
+    :type env: Mapping[str, str]
+    :param name: Nombre de la variable
+    :type name: str
+    :param default: Ruta por omisión
+    :type default: str
+    :return: Ruta absoluta al archivo
+    :rtype: pathlib.Path
+    :raises ConfigError: Si el archivo no existe
+    """
+    raw = env.get(name, default)
+    path = Path(raw)
+    if not path.is_absolute():
+        path = PRODUCT_ROOT / path
+    if not path.is_file():
+        raise ConfigError(f"{name} points to a missing file: {raw!r}")
+    return path.resolve()
+
+
+def _positive_number(env, name, default):
+    """Lee una variable como número mayor que cero.
+
+    :param env: Mapeo de variables de entorno
+    :type env: Mapping[str, str]
+    :param name: Nombre de la variable
+    :type name: str
+    :param default: Valor por omisión, como texto
+    :type default: str
+    :return: El número leído
+    :rtype: float
+    :raises ConfigError: Si no es un número o no es mayor que cero
+    """
+    raw = env.get(name, default)
+    try:
+        value = float(str(raw).strip())
+    except ValueError as error:
+        raise ConfigError(f"{name} must be a positive number, got {raw!r}") from error
+    # ``isfinite`` descarta ``nan`` e ``inf``, que ``float`` acepta.
+    if not (math.isfinite(value) and value > 0):
+        raise ConfigError(f"{name} must be a positive number, got {raw!r}")
+    return value
+
+
+def _pii_input_mode(env):
+    """Lee ``PII_INPUT_MODE``: ``redact`` (omisión), ``block`` u ``off``.
+
+    :param env: Mapeo de variables de entorno
+    :type env: Mapping[str, str]
+    :return: El modo
+    :rtype: str
+    :raises ConfigError: Si el valor no es uno de los permitidos
+    """
+    value = _text(env, "PII_INPUT_MODE", DEFAULT_PII_INPUT_MODE).lower()
+    if value not in PII_INPUT_MODES:
+        raise ConfigError(f"PII_INPUT_MODE must be one of {PII_INPUT_MODES}")
+    return value
+
+
+def _resilience_fields(env):
+    """Lee las variables de reintentos, respaldo y tiempo de espera del modelo.
+
+    :param env: Mapeo de variables de entorno
+    :type env: Mapping[str, str]
+    :return: Los campos de ``Settings`` por nombre
+    :rtype: dict
+    """
+    return {
+        "model_retries": _non_negative_int(
+            env, "MODEL_RETRIES", DEFAULT_MODEL_RETRIES
+        ),
+        "model_retry_backoff_ms": _non_negative_int(
+            env, "MODEL_RETRY_BACKOFF_MS", DEFAULT_MODEL_RETRY_BACKOFF_MS
+        ),
+        "model_fallback": _boolean(env, "MODEL_FALLBACK", DEFAULT_MODEL_FALLBACK),
+        "model_timeout_seconds": _positive_number(
+            env, "MODEL_TIMEOUT_SECONDS", DEFAULT_MODEL_TIMEOUT_SECONDS
+        ),
+    }
+
+
+def _guardrail_fields(env):
+    """Lee las variables del guard, del reviewer y del tamaño del cuerpo.
+
+    :param env: Mapeo de variables de entorno
+    :type env: Mapping[str, str]
+    :return: Los campos de ``Settings`` por nombre
+    :rtype: dict
+    """
+    return {
+        "pii_input_mode": _pii_input_mode(env),
+        "injection_guard": _boolean(env, "INJECTION_GUARD", DEFAULT_INJECTION_GUARD),
+        "max_answer_chars": _positive_int(
+            env, "MAX_ANSWER_CHARS", DEFAULT_MAX_ANSWER_CHARS
+        ),
+        "max_body_bytes": _positive_int(env, "MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
+    }
 
 
 def _non_negative_int(env, name, default):
@@ -416,6 +563,7 @@ def _build_settings(env):
     account_id, gateway_id, api_token = _gateway_credentials(env, provider)
     prices_path = _prices_path(env)
     model_small, model_large = _priced_models(env, prices_path)
+    api_keys = parse_api_keys(env.get("API_KEYS", ""))
     return Settings(
         model_provider=provider,
         agent_max_steps=_positive_int(
@@ -457,8 +605,14 @@ def _build_settings(env):
         ),
         prices_path=prices_path,
         environment=_environment(env),
-        api_keys=parse_api_keys(env.get("API_KEYS", "")),
+        api_keys=api_keys,
+        api_key_scopes=parse_api_key_scopes(
+            env.get("API_KEY_SCOPES", ""), api_keys.keys()
+        ),
         rate_limit_per_minute=_positive_int(
             env, "RATE_LIMIT_PER_MINUTE", DEFAULT_RATE_LIMIT_PER_MINUTE
         ),
+        policies_path=_data_path(env, "POLICIES_PATH", DEFAULT_POLICIES_PATH),
+        **_resilience_fields(env),
+        **_guardrail_fields(env),
     )

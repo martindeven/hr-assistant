@@ -11,6 +11,7 @@ PRODUCTION_ENVIRONMENT = "production"
 FORBIDDEN_PRODUCTION_PROVIDER = "fake"
 MIN_PRODUCTION_KEY_LENGTH = 16
 FAILURE_SEPARATOR = "; "
+DISABLED_PII_INPUT_MODE = "off"
 
 
 def _model_rule(settings):
@@ -62,7 +63,56 @@ def _tracing_rule(settings):
     return failures
 
 
-RULES = (_model_rule, _api_keys_rule, _tracing_rule)
+def _pii_input_rule(settings):
+    """Prohíbe apagar la revisión de datos personales de la entrada.
+
+    :param settings: Configuración ya leída
+    :type settings: app.config.Settings
+    :return: Las fallas de la regla
+    :rtype: list[str]
+    """
+    if settings.pii_input_mode == DISABLED_PII_INPUT_MODE:
+        return [f"PII_INPUT_MODE must not be '{DISABLED_PII_INPUT_MODE}'"]
+    return []
+
+
+def _injection_guard_rule(settings):
+    """Exige el bloqueo de inyección de instrucciones.
+
+    :param settings: Configuración ya leída
+    :type settings: app.config.Settings
+    :return: Las fallas de la regla
+    :rtype: list[str]
+    """
+    if not settings.injection_guard:
+        return ["INJECTION_GUARD must be 'true'"]
+    return []
+
+
+def _scopes_rule(settings):
+    """Exige una entrada de ``API_KEY_SCOPES`` para cada cliente de ``API_KEYS``.
+
+    :param settings: Configuración ya leída
+    :type settings: app.config.Settings
+    :return: Las fallas de la regla, con el nombre de cada cliente (nunca su
+        clave)
+    :rtype: list[str]
+    """
+    return [
+        f"API_KEY_SCOPES has no entry for client '{client}'"
+        for client in settings.api_keys
+        if client not in settings.api_key_scopes
+    ]
+
+
+RULES = (
+    _model_rule,
+    _api_keys_rule,
+    _tracing_rule,
+    _pii_input_rule,
+    _injection_guard_rule,
+    _scopes_rule,
+)
 
 
 def check_production(settings):

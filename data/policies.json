@@ -1,0 +1,37 @@
+[
+  {
+    "topic": "vacaciones",
+    "keywords": ["vacaciones", "dias libres", "descanso anual"],
+    "text": "Vacaciones: 12 días hábiles el primer año de servicio; suben 2 días por año hasta llegar a 20 días, y después 2 días cada 5 años. Se piden con 15 días de anticipación en el portal de RH."
+  },
+  {
+    "topic": "prima vacacional",
+    "keywords": ["prima vacacional"],
+    "text": "Prima vacacional: 25 % del salario de los días de vacaciones, pagada al tomar el periodo."
+  },
+  {
+    "topic": "aguinaldo",
+    "keywords": ["aguinaldo"],
+    "text": "Aguinaldo: 15 días de salario, pagado antes del 20 de diciembre; proporcional si se trabajó menos de un año."
+  },
+  {
+    "topic": "home office",
+    "keywords": ["home office", "trabajo remoto", "teletrabajo", "remoto"],
+    "text": "Trabajo remoto: hasta 2 días por semana con aprobación del jefe directo; la empresa da una ayuda mensual para internet y luz."
+  },
+  {
+    "topic": "horario",
+    "keywords": ["horario", "jornada", "hora de entrada"],
+    "text": "Horario: jornada de 40 horas semanales, de lunes a viernes, con entrada flexible entre las 8:00 y las 10:00."
+  },
+  {
+    "topic": "incapacidad",
+    "keywords": ["incapacidad", "enfermedad", "permiso medico"],
+    "text": "Incapacidad: se entrega el comprobante del IMSS a RH en un máximo de 48 horas; los primeros 3 días los cubre la empresa."
+  },
+  {
+    "topic": "permisos",
+    "keywords": ["permiso", "permisos", "paternidad", "maternidad", "luto"],
+    "text": "Permisos: maternidad 12 semanas, paternidad 5 días hábiles y luto 3 días hábiles, todos con goce de sueldo."
+  }
+]

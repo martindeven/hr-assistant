@@ -234,7 +234,13 @@ def slo_is_not_met(metrics):
 
 
 @then("the page shows the request id without using innerHTML")
-def page_shows_request_id(response):
-    """Comprueba que la página pinta el id con texto plano."""
-    assert "request_id" in response.text
-    assert "innerHTML" not in response.text
+def page_shows_request_id(observed, response):
+    """Comprueba que el script de la página pinta el id con texto plano.
+
+    La CSP no permite código en línea: la lógica vive en ``/static/app.js``.
+    """
+    script = observed.http.get("/static/app.js").text
+    assert 'src="/static/app.js"' in response.text
+    assert "request_id" in script
+    assert "textContent" in script
+    assert "innerHTML" not in response.text + script

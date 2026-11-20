@@ -234,19 +234,25 @@ def make_observed_client(directory):
     """Fabrica un cliente con reloj falso, log en memoria e ids fijos.
 
     El ``Tracer`` va apagado: ninguna prueba toca la red ni la hora real. Con
-    ``send_key=False`` el cliente no manda ``X-API-Key`` por omisión.
+    ``send_key=False`` el cliente no manda ``X-API-Key`` por omisión. Con
+    ``models`` se inyecta un modelo por nombre (reto, parte 1: respaldo) y con
+    ``directory`` otro directorio (por ejemplo, uno que anota sus lecturas).
     """
 
-    def _make(model=None, clock=None, env=None, send_key=True):
+    # Cada dependencia es opcional para que cada prueba cambie solo la suya.
+    def _make(  # pylint: disable=too-many-arguments
+        model=None, clock=None, env=None, send_key=True, models=None, **overrides
+    ):
         log_stream = io.StringIO()
         app = create_app(
             settings=load_settings(with_test_key(env)),
             model=model or FakeModel(directory.departments()),
-            directory=directory,
+            directory=overrides.get("directory", directory),
             clock=clock or FakeClock(),
             log_stream=log_stream,
             tracer=Tracer(enabled=False),
             new_id=sequential_ids(),
+            models=models,
         )
         headers = {API_KEY_HEADER: TEST_API_KEY} if send_key else {}
         return ObservedClient(

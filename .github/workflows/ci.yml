@@ -1,5 +1,6 @@
-# Pipeline de CI del HR Assistant (spec/04-production.md, punto 6; doc/adr/0012).
-# Cuatro etapas encadenadas: si una falla, las siguientes no corren y Render no publica
+# Pipeline de CI del HR Assistant (spec/04-production.md, punto 6;
+# spec/05-multiagent-security.md, punto 5; doc/adr/0012).
+# Cinco etapas encadenadas (style -> security -> unit -> e2e -> docker): si una falla, las siguientes no corren y Render no publica
 # (render.yaml usa autoDeployTrigger: checksPass).
 name: CI
 
@@ -30,9 +31,35 @@ jobs:
           python -m pylint app tests --max-line-length=88 --fail-under=10
           --disable=missing-function-docstring,redefined-outer-name,too-few-public-methods
 
-  # Etapa 2: pruebas unitarias y BDD con cobertura de 80 % o más
-  unit:
+  # Etapa 2: seguridad (spec/05-multiagent-security.md, punto 5). pip-audit y bandit
+  # se instalan solo aquí; no van en requirements.txt.
+  security:
     needs: style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # gitleaks revisa todo el historial, no solo el último commit
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Instalar herramientas de seguridad
+        run: pip install pip-audit bandit
+      - name: pip-audit (dependencias con vulnerabilidades conocidas)
+        run: pip-audit -r requirements.txt
+      - name: bandit (código inseguro, severidad media o alta)
+        run: bandit -r app -ll
+      - name: gitleaks (secretos en el historial)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          # Token que GitHub crea para cada corrida; no es un secreto escrito aquí
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Etapa 3: pruebas unitarias y BDD con cobertura de 80 % o más
+  unit:
+    needs: security
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -45,7 +72,7 @@ jobs:
       - name: Pruebas con cobertura
         run: python -m pytest tests -q --cov=app --cov-report=term --cov-fail-under=80
 
-  # Etapa 3: Playwright contra el producto vivo con el modelo simulado
+  # Etapa 4: Playwright contra el producto vivo con el modelo simulado
   e2e:
     needs: unit
     runs-on: ubuntu-latest
@@ -88,7 +115,7 @@ jobs:
         if: always()
         run: cat server.log
 
-  # Etapa 4: la imagen de Docker se construye
+  # Etapa 5: la imagen de Docker se construye
   docker:
     needs: e2e
     runs-on: ubuntu-latest
