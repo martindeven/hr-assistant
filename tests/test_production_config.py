@@ -4,6 +4,10 @@ import pytest
 
 from app.config import ConfigError, load_settings
 
+# Clave de prueba armada en tiempo de ejecución: no es un secreto y no debe
+# parecerlo (gitleaks).
+REPR_KEY = "-".join(["repr", "test"] * 3)
+
 
 def test_production_settings_default_to_development_without_keys():
     settings = load_settings({})
@@ -30,7 +34,7 @@ def test_invalid_production_setting_names_the_variable(variable, value):
 
 
 def test_settings_repr_never_shows_an_api_key():
-    settings = load_settings({"API_KEYS": "ops:repr-secret-0123456789"})
+    settings = load_settings({"API_KEYS": f"ops:{REPR_KEY}"})
 
-    assert settings.api_keys == {"ops": "repr-secret-0123456789"}
-    assert "repr-secret-0123456789" not in repr(settings)
+    assert settings.api_keys == {"ops": REPR_KEY}
+    assert REPR_KEY not in repr(settings)

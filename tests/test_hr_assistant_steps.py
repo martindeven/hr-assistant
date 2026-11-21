@@ -10,7 +10,8 @@ QUESTIONS_BY_KIND = {
     "2001 characters long": "a" * 2001,
 }
 # La sesión 2 suma ``request_id`` a los 5 campos de la sesión 1 y la sesión 3
-# suma ``model``, ``route``, ``cached_calls`` y ``cost_usd``.
+# suma ``model``, ``route``, ``cached_calls`` y ``cost_usd``. La spec 05 suma
+# ``agents``, ``guardrails`` y ``fallback``. La spec 06 suma ``cache``.
 RESPONSE_FIELDS = {
     "answer",
     "steps",
@@ -22,6 +23,10 @@ RESPONSE_FIELDS = {
     "route",
     "cached_calls",
     "cost_usd",
+    "agents",
+    "guardrails",
+    "fallback",
+    "cache",
 }
 
 

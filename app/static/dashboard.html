@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HR Assistant - Tablero</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; color: #1f2933; }
+    h1 { font-size: 1.4rem; }
+    h2 { font-size: 1.1rem; margin-top: 1.5rem; }
+    .key-row { display: flex; gap: 0.5rem; align-items: center; }
+    .cards { display: grid; gap: 0.75rem;
+             grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr)); }
+    .card { border: 1px solid #cbd2d9; border-radius: 0.5rem; padding: 0.75rem; }
+    .card .label { display: block; font-size: 0.85rem; color: #52606d; }
+    .card .value { display: block; font-size: 1.3rem; font-weight: 600; }
+    table { border-collapse: collapse; margin-top: 0.5rem; min-width: 20rem; }
+    th, td { border: 1px solid #cbd2d9; padding: 0.3rem 0.6rem; text-align: left; }
+    .alerts li { color: #b42318; font-weight: 600; }
+    .alerts li.quiet { color: #52606d; font-weight: 400; }
+    .status { color: #52606d; }
+  </style>
+</head>
+<body>
+  <h1>Tablero del Asistente de Recursos Humanos</h1>
+  <div class="key-row">
+    <label for="api-key">Clave de acceso</label>
+    <input id="api-key" data-testid="api-key" type="password"
+           placeholder="Escribe la clave que te dieron" autocomplete="off">
+  </div>
+  <p id="status" class="status">Esperando la clave para leer las métricas.</p>
+  <p>Proceso que respondió (pid): <span id="pid">-</span></p>
+
+  <div class="cards" data-testid="dashboard">
+    <div class="card"><span class="label">Peticiones</span>
+      <span class="value" id="requests">-</span></div>
+    <div class="card"><span class="label">Tasa de error</span>
+      <span class="value" id="error-rate">-</span></div>
+    <div class="card"><span class="label">Latencia p50</span>
+      <span class="value" id="p50">-</span></div>
+    <div class="card"><span class="label">Latencia p95 contra el SLO</span>
+      <span class="value" id="p95">-</span></div>
+    <div class="card"><span class="label">Costo total (USD)</span>
+      <span class="value" id="cost-total">-</span></div>
+    <div class="card"><span class="label">Costo por respuesta (USD)</span>
+      <span class="value" id="cost-per-request">-</span></div>
+    <div class="card"><span class="label">Tasa de caché</span>
+      <span class="value" id="hit-rate">-</span></div>
+    <div class="card"><span class="label">Bloqueos de seguridad</span>
+      <span class="value" id="blocks">-</span></div>
+  </div>
+
+  <h2>Alertas encendidas</h2>
+  <ul class="alerts" id="alerts" data-testid="alerts"></ul>
+
+  <h2>Por agente</h2>
+  <table>
+    <thead><tr><th>Agente</th><th>Corridas</th><th>Errores</th><th>p95 (ms)</th></tr></thead>
+    <tbody id="by-agent"></tbody>
+  </table>
+
+  <h2>Por cliente</h2>
+  <table>
+    <thead><tr><th>Cliente</th><th>Preguntas</th><th>Costo (USD)</th></tr></thead>
+    <tbody id="by-client"></tbody>
+  </table>
+
+  <h2>Por modelo</h2>
+  <table>
+    <thead><tr><th>Modelo</th><th>Llamadas</th><th>Costo (USD)</th></tr></thead>
+    <tbody id="by-model"></tbody>
+  </table>
+
+  <script>
+    // Tablero del HR Assistant. Todo el texto se pone con textContent.
+    (function () {
+      "use strict";
+
+      // La misma entrada de sessionStorage que usa la página principal.
+      const API_KEY_STORAGE = "hrAssistantApiKey";
+      const REFRESH_MS = 10000;
+      const keyInput = document.getElementById("api-key");
+      const statusLine = document.getElementById("status");
+
+      function readStoredKey() {
+        try {
+          return sessionStorage.getItem(API_KEY_STORAGE) || "";
+        } catch (storageError) {
+          return "";
+        }
+      }
+
+      function storeKey(value) {
+        try {
+          if (value) {
+            sessionStorage.setItem(API_KEY_STORAGE, value);
+          } else {
+            sessionStorage.removeItem(API_KEY_STORAGE);
+          }
+        } catch (storageError) {
+          // Sin almacenamiento, la clave se lee del campo en cada lectura.
+        }
+      }
+
+      function setText(id, text) {
+        document.getElementById(id).textContent = text;
+      }
+
+      function percent(value) {
+        return (Number(value || 0) * 100).toFixed(1) + " %";
+      }
+
+      function usd(value) {
+        return Number(value || 0).toFixed(6);
+      }
+
+      // Llena el cuerpo de una tabla, una fila por entrada, solo con texto.
+      function fillTable(id, rows) {
+        const body = document.getElementById(id);
+        body.replaceChildren();
+        rows.forEach(function (row) {
+          const line = document.createElement("tr");
+          row.forEach(function (value) {
+            const cell = document.createElement("td");
+            cell.textContent = String(value);
+            line.appendChild(cell);
+          });
+          body.appendChild(line);
+        });
+      }
+
+      function renderAlerts(alerts) {
+        const list = document.getElementById("alerts");
+        list.replaceChildren();
+        const names = Array.isArray(alerts) ? alerts : [];
+        if (!names.length) {
+          const item = document.createElement("li");
+          item.className = "quiet";
+          item.textContent = "Sin alertas encendidas";
+          list.appendChild(item);
+          return;
+        }
+        names.forEach(function (name) {
+          const item = document.createElement("li");
+          item.textContent = String(name);
+          list.appendChild(item);
+        });
+      }
+
+      function renderTables(metrics) {
+        const byAgent = metrics.by_agent || {};
+        fillTable("by-agent", Object.keys(byAgent).sort().map(function (name) {
+          const data = byAgent[name];
+          return [name, data.runs, data.errors, data.p95_ms];
+        }));
+        const byClient = metrics.by_client || {};
+        fillTable("by-client", Object.keys(byClient).sort().map(function (name) {
+          const data = byClient[name];
+          return [name, data.requests, usd(data.cost_usd)];
+        }));
+        const byModel = metrics.by_model || {};
+        fillTable("by-model", Object.keys(byModel).sort().map(function (name) {
+          const data = byModel[name];
+          return [name, data.calls, usd(data.cost_usd)];
+        }));
+      }
+
+      function render(metrics) {
+        const latency = metrics.latency_ms || {};
+        const slo = metrics.slo || {};
+        const guardrails = metrics.guardrails || {};
+        const cache = metrics.cache || {};
+        setText("pid", String(metrics.pid));
+        setText("requests", String(metrics.requests));
+        setText("error-rate", percent(metrics.error_rate));
+        setText("p50", latency.p50 + " ms");
+        setText("p95", latency.p95 + " ms / " + slo.p95_ms_target + " ms"
+          + (slo.met ? " (cumple)" : " (no cumple)"));
+        setText("cost-total", usd(metrics.cost_usd));
+        setText("cost-per-request", usd(metrics.cost_usd_per_request));
+        setText("hit-rate", percent(cache.hit_rate));
+        setText("blocks", String(
+          Number(guardrails.injection_blocked || 0) + Number(guardrails.forbidden || 0)
+        ));
+        renderAlerts(metrics.alerts);
+        renderTables(metrics);
+      }
+
+      function explain(status) {
+        if (status === 401) {
+          return "Clave inválida.";
+        }
+        if (status === 403) {
+          return "Esta clave no tiene permiso para ver las métricas.";
+        }
+        if (status === 429) {
+          return "Demasiadas lecturas; se reintenta en la siguiente vuelta.";
+        }
+        return "El servidor respondió con un error.";
+      }
+
+      async function refresh() {
+        const apiKey = keyInput.value.trim();
+        if (!apiKey) {
+          statusLine.textContent = "Esperando la clave para leer las métricas.";
+          return;
+        }
+        try {
+          const response = await fetch("/metrics", {
+            headers: { "X-API-Key": apiKey },
+            cache: "no-store",
+          });
+          if (!response.ok) {
+            statusLine.textContent = "Error: " + explain(response.status);
+            return;
+          }
+          render(await response.json());
+          statusLine.textContent = "Métricas al día; se leen cada 10 segundos.";
+        } catch (error) {
+          statusLine.textContent = "Error: no se pudo conectar con el servidor.";
+        }
+      }
+
+      keyInput.value = readStoredKey();
+      keyInput.addEventListener("input", function () {
+        storeKey(keyInput.value.trim());
+        refresh();
+      });
+      // Primera lectura al cargar; después, cada 10 segundos.
+      refresh();
+      setInterval(refresh, REFRESH_MS);
+    })();
+  </script>
+</body>
+</html>

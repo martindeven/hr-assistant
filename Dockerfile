@@ -1,4 +1,5 @@
-# Imagen del HR Assistant (spec/04-production.md, punto 5; doc/adr/0012).
+# Imagen del HR Assistant (spec/04-production.md, punto 5; spec/05-multiagent-security.md,
+# punto 5; doc/adr/0012).
 FROM python:3.12-slim
 
 # Salida sin búfer para que los logs JSON lleguen enseguida; sin archivos .pyc
@@ -23,5 +24,7 @@ USER appuser
 
 EXPOSE 8000
 
-# Render pone PORT; en local se usa 8000. exec deja a uvicorn como PID 1 para recibir las señales
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Render pone PORT; en local se usa 8000. exec deja a uvicorn como PID 1 para recibir las señales.
+# WEB_CONCURRENCY fija cuántos procesos arranca uvicorn (spec/05-multiagent-security.md, punto 2):
+# cada proceso tiene sus propias métricas y su propio límite de peticiones.
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers ${WEB_CONCURRENCY:-2}"]

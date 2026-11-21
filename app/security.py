@@ -1,4 +1,4 @@
-"""Acceso por clave de cliente y límite de peticiones en la API.
+"""Acceso por clave de cliente, límite de peticiones y permiso de métricas.
 
 Ninguna función de este módulo escribe una clave en el log, en una traza ni en
 un mensaje de error: los errores dicen el número de entrada y su largo.
@@ -9,12 +9,23 @@ import hmac
 from fastapi.responses import JSONResponse
 
 from app.errors import ConfigError
+from app.scopes import METRICS_PERMISSION, PERMISSIONS
 
 API_KEY_HEADER = "X-API-Key"
 ENTRY_SEPARATOR = ","
 CLIENT_SEPARATOR = ":"
 PUBLIC_PATHS = frozenset(
-    {"/", "/health", "/docs", "/docs/oauth2-redirect", "/openapi.json"}
+    {
+        "/",
+        "/dashboard",
+        "/health",
+        "/ready",
+        "/static/app.js",
+        "/static/app.css",
+        "/docs",
+        "/docs/oauth2-redirect",
+        "/openapi.json",
+    }
 )
 UNAUTHORIZED_STATUS = 401
 UNAUTHORIZED_DETAIL = "invalid or missing API key"
@@ -22,6 +33,10 @@ RATE_LIMITED_STATUS = 429
 RATE_LIMITED_DETAIL = "rate limit exceeded"
 RETRY_AFTER_HEADER = "Retry-After"
 KEY_ENCODING = "utf-8"
+FORBIDDEN_STATUS = 403
+FORBIDDEN_DETAIL = "forbidden for this client"
+METRICS_PATH = "/metrics"
+PATH_LIMIT = 200
 
 
 def _malformed(number, entry):
@@ -152,14 +167,60 @@ def _rate_limited(retry_after):
     )
 
 
-def install_security(application, authenticator, limiter):
-    """Instala el middleware que pide clave y aplica el límite.
+def _forbidden(request_id):
+    """Arma la respuesta ``403`` de una ruta que el cliente no tiene permitida.
+
+    :param request_id: Id de la petición, o ``None``
+    :type request_id: str or None
+    :return: La respuesta ``403``
+    :rtype: fastapi.responses.JSONResponse
+    """
+    return JSONResponse(
+        status_code=FORBIDDEN_STATUS,
+        content={"detail": FORBIDDEN_DETAIL, "request_id": request_id},
+    )
+
+
+def is_metrics_path(path):
+    """Indica si una ruta es ``/metrics`` o cuelga de ella.
+
+    :param path: Ruta de la petición
+    :type path: str
+    :return: ``True`` para ``/metrics`` y ``/metrics/...``
+    :rtype: bool
+    """
+    return path == METRICS_PATH or path.startswith(METRICS_PATH + "/")
+
+
+def _all_permissions(client):
+    """Permisos por omisión: todos (para instalar la seguridad sin scopes).
+
+    :param client: Nombre del cliente
+    :type client: str
+    :return: Todos los permisos
+    :rtype: frozenset[str]
+    """
+    del client
+    return PERMISSIONS
+
+
+def _no_audit(action, outcome, request_id, client, **fields):
+    """Auditor que no hace nada, para instalar la seguridad sin log."""
+    del action, outcome, request_id, client, fields
+
+
+def install_security(
+    application, authenticator, limiter, *, auditor=None, permissions=None
+):
+    """Instala el middleware que pide clave, aplica el límite y los permisos.
 
     Niega por omisión: toda ruta fuera de ``PUBLIC_PATHS`` pide clave, también
     las que no existen. La clave se revisa antes de validar el cuerpo, así que
     sin clave la respuesta es ``401`` y nunca ``422``. Debe instalarse antes que
     la observabilidad para que esta quede por fuera y el ``401``/``429`` lleve
-    ``X-Request-ID`` y su evento ``request``.
+    ``X-Request-ID`` y su evento ``request``. Audita ``auth_failed`` (con
+    ``client`` nulo y la ruta), ``rate_limited`` y, si el cliente no tiene el
+    permiso ``metrics``, ``forbidden`` con ``403`` en ``/metrics``.
 
     :param application: Aplicación donde se instala
     :type application: fastapi.FastAPI
@@ -167,18 +228,32 @@ def install_security(application, authenticator, limiter):
     :type authenticator: ApiKeyAuthenticator
     :param limiter: Límite de peticiones por cliente
     :type limiter: app.ratelimit.RateLimiter
+    :param auditor: Eventos ``audit``; por omisión no se audita
+    :type auditor: app.audit.Auditor or None
+    :param permissions: Función que da los permisos de un cliente; por omisión
+        todos
+    :type permissions: collections.abc.Callable[[str], frozenset[str]] or None
     """
+    emit = auditor.emit if auditor is not None else _no_audit
+    permissions = permissions or _all_permissions
 
     @application.middleware("http")
     async def protect(request, call_next):
         """Deja pasar las rutas públicas y exige clave en las demás."""
-        if request.url.path in PUBLIC_PATHS:
+        path = request.url.path
+        if path in PUBLIC_PATHS:
             return await call_next(request)
+        request_id = getattr(request.state, "request_id", None)
         client = authenticator.identify(request.headers.get(API_KEY_HEADER))
         if client is None:
+            emit("auth_failed", "denied", request_id, None, path=path[:PATH_LIMIT])
             return _unauthorized()
         request.state.client = client
         decision = limiter.check(client)
         if not decision.allowed:
+            emit("rate_limited", "denied", request_id, client)
             return _rate_limited(decision.retry_after)
+        if is_metrics_path(path) and METRICS_PERMISSION not in permissions(client):
+            emit("forbidden", "denied", request_id, client, path=path[:PATH_LIMIT])
+            return _forbidden(request_id)
         return await call_next(request)

@@ -6,6 +6,8 @@ from app.metrics import MetricsRecorder
 def test_metrics_without_requests_are_zero_and_meet_the_slo():
     recorder = MetricsRecorder(slo_p95_ms=2000)
 
+    # Los 7 campos de antes conservan sus valores; la spec 06 suma desgloses
+    # vacíos, contadores en cero y ninguna alerta.
     assert recorder.snapshot(pid=42) == {
         "pid": 42,
         "requests": 0,
@@ -14,6 +16,21 @@ def test_metrics_without_requests_are_zero_and_meet_the_slo():
         "tokens": {"input": 0, "output": 0},
         "cost_usd": 0.0,
         "slo": {"p95_ms_target": 2000, "met": True},
+        "by_agent": {},
+        "by_client": {},
+        "by_model": {},
+        "by_route": {},
+        "guardrails": {
+            "pii_input": 0,
+            "pii_output": 0,
+            "injection_blocked": 0,
+            "forbidden": 0,
+            "output_replaced": 0,
+        },
+        "cache": {"response_hits": 0, "gateway_hits": 0, "hit_rate": 0},
+        "fallbacks": 0,
+        "cost_usd_per_request": 0,
+        "alerts": [],
     }
 
 

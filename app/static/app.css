@@ -1,0 +1,24 @@
+body {
+  font-family: system-ui, sans-serif;
+  max-width: 760px;
+  margin: 2rem auto;
+  padding: 0 1rem;
+  color: #222;
+}
+h1 { font-size: 1.5rem; }
+#conversation {
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  padding: 1rem;
+  min-height: 200px;
+  margin-bottom: 1rem;
+}
+.message { margin: 0 0 0.8rem; white-space: pre-wrap; }
+.user { font-weight: bold; }
+.tools, .request-id, .agents { font-size: 0.85rem; color: #666; }
+.guardrail-notice { font-size: 0.85rem; color: #8a5a00; }
+.error { color: #b00020; }
+form, .key-row { display: flex; gap: 0.5rem; }
+.key-row { align-items: center; margin-bottom: 1rem; }
+input { flex: 1; padding: 0.5rem; font-size: 1rem; }
+button { padding: 0.5rem 1rem; font-size: 1rem; }

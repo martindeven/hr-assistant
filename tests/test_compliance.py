@@ -7,16 +7,24 @@ import pytest
 
 from app.config import ConfigError, load_settings
 
-PROD_KEY = "prod-key-0123456789"
-SHORT_KEY = "abcdefghij12345"
+# Claves de prueba armadas en tiempo de ejecución con palabras repetidas: no
+# son secretos y no deben parecerlo (gitleaks). SHORT_KEY mide 15 caracteres,
+# uno menos que el mínimo de producción.
+PROD_KEY = "-".join(["prod", "test"] * 3)
+SHORT_KEY = "short" * 3
 SAFE_PRODUCTION_ENV = {
     "ENVIRONMENT": "production",
     "MODEL_PROVIDER": "gateway",
     "CF_ACCOUNT_ID": "acc123",
-    "CF_API_TOKEN": "cf-token-not-real",
+    "CF_API_TOKEN": "-".join(["gateway", "test"] * 3),
     "API_KEYS": f"ops:{PROD_KEY}",
+    # Regla 3.7 de la spec 05: en producción cada cliente necesita alcances.
+    "API_KEY_SCOPES": "ops:directory policies metrics",
 }
-TRACING_ON = {"LANGSMITH_TRACING": "true", "LANGSMITH_API_KEY": "lsv2-not-real"}
+TRACING_ON = {
+    "LANGSMITH_TRACING": "true",
+    "LANGSMITH_API_KEY": "-".join(["tracing", "test"] * 3),
+}
 
 
 @pytest.mark.parametrize(

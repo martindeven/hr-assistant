@@ -1,0 +1,6 @@
+# Falsos positivos revisados a mano (gitleaks, regla generic-api-key).
+# Claves de prueba falsas en el commit bfb6dc8; el commit 62713b6 las cambió a "-".join([...]).
+# No dan acceso a nada: solo existen en las pruebas.
+# Formato: <commit>:<archivo>:<regla>:<línea>
+bfb6dc89a3b6eaa7a7360ad5b9d08d4136c1e8a5:tests/test_layered_security.py:generic-api-key:23
+bfb6dc89a3b6eaa7a7360ad5b9d08d4136c1e8a5:tests/test_security_steps.py:generic-api-key:11

@@ -1,4 +1,5 @@
-# Blueprint de Render para el HR Assistant (spec/04-production.md, punto 7).
+# Blueprint de Render para el HR Assistant (spec/04-production.md, punto 7;
+# spec/05-multiagent-security.md, punto 5; spec/06-observability-costs.md).
 # El servicio se llama igual que el repositorio para no pisar otro servicio de la cuenta.
 services:
   - type: web
@@ -19,10 +20,37 @@ services:
         value: "true"
       - key: HIDE_OUTPUTS
         value: "true"
+      # Reto, parte 1 (spec/05-multiagent-security.md, punto 5): procesos de uvicorn
+      # y capas de seguridad que compliance exige encendidas en producción
+      - key: WEB_CONCURRENCY
+        value: "2"
+      - key: PII_INPUT_MODE
+        value: redact
+      - key: INJECTION_GUARD
+        value: "true"
+      # Reto, parte 2 (spec/06-observability-costs.md): caché de respuestas encendida
+      # con 300 s, proyecto de LangSmith y umbrales de alertas con sus valores por omisión.
+      # LANGSMITH_TRACING no se fija aquí: las trazas quedan apagadas hasta que la
+      # persona la ponga en true en Render > Environment.
+      - key: RESPONSE_CACHE_TTL_SECONDS
+        value: "300"
+      - key: LANGSMITH_PROJECT
+        value: hr-assistant
+      - key: ALERT_ERROR_RATE
+        value: "0.05"
+      - key: ALERT_COST_PER_REQUEST_USD
+        value: "0.001"
+      - key: ALERT_GUARDRAIL_EVENTS
+        value: "10"
       # Secretos: la persona los escribe en Render al crear el Blueprint, nunca aquí.
-      # LANGSMITH_API_KEY es opcional y se agrega en Render > Environment si se
-      # encienden las trazas.
+      # LANGSMITH_API_KEY solo hace falta si se encienden las trazas.
+      - key: LANGSMITH_API_KEY
+        sync: false
       - key: API_KEYS
+        sync: false
+      # Permisos por cliente: no es una clave, pero nombra a los clientes. Cada cliente
+      # de API_KEYS necesita su entrada o el producto no arranca en producción.
+      - key: API_KEY_SCOPES
         sync: false
       - key: CF_ACCOUNT_ID
         sync: false

@@ -16,8 +16,10 @@ scenarios("features/production.feature")
 
 INVALID_KEY_BODY = {"detail": "invalid or missing API key"}
 RATE_LIMIT_BODY = {"detail": "rate limit exceeded"}
-OPS_KEY = "ops-key-0123456789"
-WEB_KEY = "web-key-0123456789"
+# Claves de prueba armadas en tiempo de ejecución con palabras repetidas: no
+# son secretos y no deben parecerlo (gitleaks).
+OPS_KEY = "-".join(["ops", "test"] * 3)
+WEB_KEY = "-".join(["web", "test"] * 3)
 
 
 @dataclass

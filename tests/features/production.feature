@@ -12,8 +12,8 @@ Feature: Production access to the HR assistant
 
   Scenario: A wrong API key is rejected on the question and on the metrics
     Given the HR assistant is running and the client sends no API key
-    When I ask "¿Quién es EMP-0004?" with the API key "wrong-key-0123456789"
-    And I read the metrics with the API key "wrong-key-0123456789"
+    When I ask "¿Quién es EMP-0004?" with the API key "wrong-test-wrong-test"
+    And I read the metrics with the API key "wrong-test-wrong-test"
     Then both responses have status 401
 
   Scenario: The page, the health check and the docs need no API key

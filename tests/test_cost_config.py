@@ -4,11 +4,13 @@ import pytest
 
 from app.config import ConfigError, load_settings
 
+# Token de prueba armado en tiempo de ejecución: no es un secreto (gitleaks).
+FAKE_TOKEN = "-".join(["gateway", "test"] * 3)
 CLOUDFLARE_ENV = {
     "MODEL_PROVIDER": "gateway",
     "CF_ACCOUNT_ID": "acc123",
     "CF_GATEWAY_ID": "gw456",
-    "CF_API_TOKEN": "secret-token-123",
+    "CF_API_TOKEN": FAKE_TOKEN,
 }
 
 
@@ -51,4 +53,4 @@ def test_invalid_cost_settings_are_rejected_but_a_zero_window_is_valid():
 def test_settings_repr_does_not_show_the_api_token():
     settings = load_settings(CLOUDFLARE_ENV)
 
-    assert "secret-token-123" not in repr(settings)
+    assert FAKE_TOKEN not in repr(settings)

@@ -4,9 +4,12 @@ import re
 
 from fastapi.responses import JSONResponse
 
+from app.security import is_metrics_path
+
 REQUEST_ID_HEADER = "X-Request-ID"
 REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,128}")
 METRICS_PATH = "/metrics"
+ASK_PATH = "/ask"
 INTERNAL_ERROR_STATUS = 500
 INTERNAL_ERROR_DETAIL = "internal error"
 LATENCY_DECIMALS = 2
@@ -36,9 +39,10 @@ def install_observability(application, logger, metrics, clock, new_id):
 
     Resuelve el ``request_id`` y lo guarda en ``request.state``, atrapa las
     excepciones (evento ``error`` y respuesta ``500`` genérica), mide la
-    latencia, alimenta las métricas (salvo ``/metrics``), escribe el evento
-    ``request`` (con el ``client`` que dejó la seguridad, o ``null``) y pone
-    ``X-Request-ID`` en toda respuesta.
+    latencia, alimenta las métricas (salvo ``/metrics`` y ``/metrics/...``),
+    cuenta cada ``/ask`` del cliente, revisa las alertas (evento ``alert`` solo
+    cuando una cambia), escribe el evento ``request`` (con el ``client`` que
+    dejó la seguridad, o ``null``) y pone ``X-Request-ID`` en toda respuesta.
 
     :param application: Aplicación donde se instala
     :type application: fastapi.FastAPI
@@ -71,8 +75,11 @@ def install_observability(application, logger, metrics, clock, new_id):
         elapsed = clock.monotonic() - started
         latency_ms = round(elapsed * MILLISECONDS_PER_SECOND, LATENCY_DECIMALS)
         path = request.url.path
-        if path != METRICS_PATH:
+        client = getattr(request.state, "client", None)
+        if not is_metrics_path(path):
+            _count_client(metrics, path, client)
             metrics.record_request(latency_ms=latency_ms, status=response.status_code)
+            _emit_alerts(metrics, logger, request_id)
         logger.emit(
             "request",
             request_id,
@@ -80,7 +87,35 @@ def install_observability(application, logger, metrics, clock, new_id):
             path=path,
             status=response.status_code,
             latency_ms=latency_ms,
-            client=getattr(request.state, "client", None),
+            client=client,
         )
         response.headers[REQUEST_ID_HEADER] = request_id
         return response
+
+
+def _count_client(metrics, path, client):
+    """Cuenta en ``by_client`` cada ``/ask`` con cliente (con cualquier código).
+
+    :param metrics: Métricas del proceso
+    :type metrics: app.metrics.MetricsRecorder
+    :param path: Ruta de la petición
+    :type path: str
+    :param client: Nombre del cliente, o ``None``
+    :type client: str or None
+    """
+    if path == ASK_PATH and client is not None:
+        metrics.record_client_request(client)
+
+
+def _emit_alerts(metrics, logger, request_id):
+    """Revisa las alertas y escribe un evento ``alert`` por cada cambio.
+
+    :param metrics: Métricas del proceso
+    :type metrics: app.metrics.MetricsRecorder
+    :param logger: Log JSON de eventos
+    :type logger: app.logs.JsonLogger
+    :param request_id: Id de la petición que disparó la revisión
+    :type request_id: str
+    """
+    for alert, state in metrics.check_alerts():
+        logger.emit("alert", request_id, alert=alert, state=state)

@@ -13,7 +13,8 @@ from app.config import load_settings
 from app.directory import EmployeeDirectory
 from app.llm import FakeModel, GatewayModel, ModelUnavailableError, build_models
 
-SECRET_TOKEN = "secret-token-123"
+# Token de prueba armado en tiempo de ejecución: no es un secreto (gitleaks).
+SECRET_TOKEN = "-".join(["gateway", "test"] * 3)
 GATEWAY_ENV = {
     "MODEL_PROVIDER": "gateway",
     "CF_ACCOUNT_ID": "acc123",

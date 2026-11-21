@@ -77,7 +77,8 @@ def test_invalid_observability_setting_names_the_variable(variable, value):
 
 
 def test_tracing_needs_an_api_key_that_is_never_stored():
-    fake_key = "lsv2-test-key-not-real"
+    # Se arma en tiempo de ejecución para que gitleaks no la tome por un secreto.
+    fake_key = "-".join(["tracing", "test"] * 3)
 
     without_key = load_settings({"LANGSMITH_TRACING": "true"})
     with_key = load_settings(
